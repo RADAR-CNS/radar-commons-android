@@ -32,7 +32,7 @@ allprojects {
     apply plugin: 'com.android.library'
     apply plugin: 'de.mobilej.unmock'
     apply plugin: 'com.jfrog.bintray'
-    apply plugin: 'com.github.dcendents.android-maven'
+    //apply plugin: 'com.github.dcendents.android-maven'
     apply plugin: 'com.jfrog.artifactory'
     apply plugin: 'idea'
 
@@ -54,6 +54,7 @@ allprojects {
 //---------------------------------------------------------------------------//
 
     repositories {
+        flatDir { dirs 'libs' }
         jcenter()
         // radar dev branches
         google()
@@ -94,16 +95,18 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-        }
-    }
-    libraryVariants.all { variant ->
-        variant.outputs.all {
-            if (variant.name == 'release') {
-                outputFileName = "${archivesBaseName}-${android.defaultConfig.versionName}.aar"
-            } else {
-                outputFileName = "${archivesBaseName}-${android.defaultConfig.versionName}-${variant.name}.aar"
+            libraryVariants.all { variant ->
+                variant.outputs.all { output ->
+                    if (output.outputFile != null && output.outputFile.name.endsWith('.aar')) {
+                        outputFileName = new File(output.outputFile.parent,
+                                "${archivesBaseName}-${android.defaultConfig.versionName}.aar")
+                    }
+                }
             }
         }
+    }
+    sourceSets {
+        main.java.srcDirs += '/absolute/path/to/RADAR-Schemas/java-sdk/radar-schemas-commons/src/generated/java'
     }
 }
 
@@ -111,6 +114,7 @@ ext.moduleName = 'radar-commons-android'
 ext.description = 'Kafka backend for processing device data.'
 
 dependencies {
+    /*
     api('org.radarcns:radar-commons:0.7') {
         exclude group: 'io.confluent', module: 'kafka-avro-serializer'
         exclude group: 'org.apache.kafka', module: 'kafka-clients'
@@ -119,6 +123,15 @@ dependencies {
         exclude group: 'org.json', module: 'json'
     }
     api 'org.radarcns:radar-schemas-commons:0.2.3'
+    */
+
+    api(project(':radar-commons')) {
+        exclude group: 'io.confluent', module: 'kafka-avro-serializer'
+        exclude group: 'org.apache.kafka', module: 'kafka-clients'
+        exclude group: 'com.fasterxml.jackson.dataformat', module: 'jackson-dataformat-yaml'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-databind'
+        exclude group: 'org.json', module: 'json'
+    }
 
     implementation 'com.google.firebase:firebase-config:11.6.2'
     implementation('com.crashlytics.sdk.android:crashlytics:2.7.1@aar') {

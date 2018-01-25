@@ -596,8 +596,8 @@ public class RadarService extends Service implements ServerStatusListener {
 
                     //Start your Activity if location was enabled:
                     if (!isGpsEnabled && !isNetworkEnabled) {
-                        needsPermissions.add(LOCATION_SERVICE);
-                        needsPermissions.add(permission);
+                        //needsPermissions.add(LOCATION_SERVICE);
+                        //needsPermissions.add(permission);
                     }
                 }
             }
