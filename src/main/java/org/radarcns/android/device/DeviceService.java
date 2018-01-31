@@ -546,8 +546,8 @@ public abstract class DeviceService<T extends BaseDeviceState> extends Service i
     public void registerDevice(String sourceIdHint, String name, Map<String, String> attributes) {
 
         logger.info("Registering source {} with attributes {}", source, attributes);
-        //if (sourceIdHint == null && source.getSourceId() != null && getDeviceManager() != null) {
-        if (source.getSourceId() != null) {
+        //if (source.getSourceId() != null) {
+        if (sourceIdHint == null && source.getSourceId() != null) {
             DeviceManager<T> localManager = getDeviceManager();
             if (localManager != null) {
                 localManager.didRegister(source);
