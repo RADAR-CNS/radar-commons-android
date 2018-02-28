@@ -29,7 +29,8 @@ public interface LoginManager {
     /** HTTP basic authentication. */
     int AUTH_TYPE_HTTP_BASIC = 2;
 
-    /** With or without user interaction, refresh the current authentication state. If successful,
+    /**
+     * With or without user interaction, refresh the current authentication state. If successful,
      * return the refreshed authentication state, otherwise return null or a stale authentication
      * state.
      * @return refreshed authentication state or null.

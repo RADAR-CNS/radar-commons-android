@@ -17,6 +17,9 @@
 package org.radarcns.android.device;
 
 import android.support.annotation.CallSuper;
+
+import com.crashlytics.android.Crashlytics;
+
 import org.apache.avro.Schema;
 import org.apache.avro.specific.SpecificRecord;
 import org.radarcns.android.auth.AppSource;
@@ -122,7 +125,13 @@ public abstract class AbstractDeviceManager<S extends DeviceService<T>, T extend
     protected <V extends SpecificRecord> void send(AvroTopic<ObservationKey, V> topic, V value) {
         ObservationKey key = deviceStatus.getId();
         if (key.getSourceId() != null) {
-            dataHandler.addMeasurement(topic, key, value);
+            try {
+                dataHandler.addMeasurement(topic, key, value);
+            } catch (IllegalArgumentException ex) {
+                Crashlytics.log("Cannot send measurement for " + getState().getId());
+                Crashlytics.logException(ex);
+                logger.error("Cannot send to topic {}: {}", topic, ex.getMessage());
+            }
         } else if (!didWarn) {
             logger.warn("Cannot send data without a source ID from {}", getClass().getSimpleName());
             didWarn = true;
@@ -147,7 +156,13 @@ public abstract class AbstractDeviceManager<S extends DeviceService<T>, T extend
     protected <V extends SpecificRecord> void trySend(AvroTopic<ObservationKey, V> topic, V value) {
         ObservationKey key = deviceStatus.getId();
         if (key.getSourceId() != null) {
-            dataHandler.trySend(topic, key, value);
+            try {
+                dataHandler.trySend(topic, key, value);
+            } catch (IllegalArgumentException ex) {
+                Crashlytics.log("Cannot send measurement for " + getState().getId());
+                Crashlytics.logException(ex);
+                logger.warn("Cannot try to send to topic {}: {}", topic, ex.getMessage());
+            }
         } else if (!didWarn) {
             logger.warn("Cannot send data without a source ID from {}", getClass().getSimpleName());
             didWarn = true;

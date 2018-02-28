@@ -21,6 +21,9 @@ import android.content.Intent;
 import android.os.Parcel;
 import android.util.Pair;
 
+import com.crashlytics.android.Crashlytics;
+
+import org.apache.avro.specific.SpecificData;
 import org.apache.avro.specific.SpecificRecord;
 import org.radarcns.android.util.SingleThreadExecutorFactory;
 import org.radarcns.data.AvroEncoder;
@@ -86,7 +89,8 @@ public class TapeCache<K extends SpecificRecord, V extends SpecificRecord> imple
      * @throws IOException if a BackedObjectQueue cannot be created.
      */
     public TapeCache(final Context context, AvroTopic<K, V> topic,
-                     SingleThreadExecutorFactory executorFactory) throws IOException {
+                     SingleThreadExecutorFactory executorFactory, SpecificData specificData)
+            throws IOException {
         this.topic = topic;
         this.timeWindowMillis = 10_000L;
         this.maxBytes = 450_000_000;
@@ -119,7 +123,7 @@ public class TapeCache<K extends SpecificRecord, V extends SpecificRecord> imple
 
         this.measurementsToAdd = new ArrayList<>();
 
-        this.converter = new TapeAvroConverter<>(topic);
+        this.converter = new TapeAvroConverter<>(topic, specificData);
         this.queue = new BackedObjectQueue<>(queueFile, converter);
         this.flusher = new Runnable() {
             @Override
@@ -305,9 +309,26 @@ public class TapeCache<K extends SpecificRecord, V extends SpecificRecord> imple
             queue.addAll(localList);
             queueSize.addAndGet(localList.size());
         } catch (IOException ex) {
-            logger.error("Failed to add record", ex);
+            logger.error("Failed to add records", ex);
             queueSize.set(queue.size());
             throw new RuntimeException(ex);
+        } catch (IllegalArgumentException ex) {
+            logger.error("Failed to validate all records; adding individual records instead: {}", ex.getMessage());
+            try {
+                logger.info("Writing {} records to file in topic {}", localList.size(), topic);
+                for (Record<K, V> record : localList) {
+                    try {
+                        queue.add(record);
+                    } catch (IllegalArgumentException ex2) {
+                        Crashlytics.logException(ex2);
+                    }
+                }
+                queueSize.addAndGet(localList.size());
+            } catch (IOException ex2) {
+                logger.error("Failed to add record", ex);
+                queueSize.set(queue.size());
+                throw new RuntimeException(ex);
+            }
         }
 
         listPool.add(localList);

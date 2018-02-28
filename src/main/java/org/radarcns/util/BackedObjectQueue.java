@@ -16,6 +16,11 @@
 
 package org.radarcns.util;
 
+import com.crashlytics.android.Crashlytics;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
@@ -31,6 +36,8 @@ import java.util.NoSuchElementException;
  * @param <T> type of objects to store.
  */
 public class BackedObjectQueue<T> implements Closeable {
+    private static final Logger logger = LoggerFactory.getLogger(BackedObjectQueue.class);
+
     private final Converter<T> converter;
     private final QueueFile queueFile;
 
@@ -54,6 +61,7 @@ public class BackedObjectQueue<T> implements Closeable {
      * @param entry element to add
      * @throws IOException if the backing file cannot be accessed, the queue is full, or the element
      *                     cannot be converted.
+     * @throws IllegalArgumentException if given entry is not a valid object for serialization.
      */
     public void add(T entry) throws IOException {
         try (QueueFileOutputStream out = queueFile.elementOutputStream()) {
@@ -66,6 +74,7 @@ public class BackedObjectQueue<T> implements Closeable {
      * @param entries elements to add
      * @throws IOException if the backing file cannot be accessed, the queue is full or the element
      *                     cannot be converted.
+     * @throws IllegalArgumentException if given entry is not a valid object for serialization.
      */
     public void addAll(Collection<? extends T> entries) throws IOException {
         try (QueueFileOutputStream out = queueFile.elementOutputStream()) {
@@ -80,6 +89,7 @@ public class BackedObjectQueue<T> implements Closeable {
      * Get the front-most object in the queue. This does not remove the element.
      * @return front-most element or null if none is available
      * @throws IOException if the element could not be read or deserialized
+     * @throws IllegalStateException if the element that was read was invalid.
      */
     public T peek() throws IOException {
         try (InputStream in = queueFile.peek()) {
@@ -89,6 +99,7 @@ public class BackedObjectQueue<T> implements Closeable {
 
     /**
      * Get at most {@code n} front-most objects in the queue. This does not remove the elements.
+     * Elements that were found to be invalid according to the current schema are
      * @param n number of elements to retrieve
      * @return list of elements, with at most {@code n} elements.
      * @throws IOException if the element could not be read or deserialized
@@ -99,7 +110,13 @@ public class BackedObjectQueue<T> implements Closeable {
         List<T> results = new ArrayList<>(n);
         for (int i = 0; i < n && iter.hasNext(); i++) {
             try (InputStream in = iter.next()) {
-                results.add(converter.deserialize(in));
+                try {
+                    results.add(converter.deserialize(in));
+                } catch (IllegalStateException ex) {
+                    Crashlytics.logException(ex);
+                    logger.warn("Invalid record ignored: {}", ex.getMessage());
+                    results.add(null);
+                }
             }
         }
         return results;

@@ -20,6 +20,7 @@ import android.content.Context;
 import android.os.Process;
 import android.support.annotation.NonNull;
 
+import org.apache.avro.specific.SpecificData;
 import org.apache.avro.specific.SpecificRecord;
 import org.radarcns.android.auth.AppAuthState;
 import org.radarcns.android.kafka.KafkaDataSubmitter;
@@ -55,12 +56,12 @@ import java.util.concurrent.atomic.AtomicLong;
 public class TableDataHandler implements DataHandler<ObservationKey, SpecificRecord>, BatteryLevelReceiver.BatteryLevelListener, NetworkConnectedReceiver.NetworkConnectedListener {
     private static final Logger logger = LoggerFactory.getLogger(TableDataHandler.class);
 
-    public static final long DATA_RETENTION_DEFAULT = 86400000L;
-    public static final int SEND_LIMIT_DEFAULT = 1000;
-    public static final long UPLOAD_RATE_DEFAULT = 10L;
-    public static final long SENDER_CONNECTION_TIMEOUT_DEFAULT = 10L;
-    public static final float MINIMUM_BATTERY_LEVEL = 0.1f;
-    public static final float REDUCED_BATTERY_LEVEL = 0.2f;
+    private static final long DATA_RETENTION_DEFAULT = 86400000L;
+    private static final int SEND_LIMIT_DEFAULT = 1000;
+    private static final long UPLOAD_RATE_DEFAULT = 10L;
+    private static final long SENDER_CONNECTION_TIMEOUT_DEFAULT = 10L;
+    private static final float MINIMUM_BATTERY_LEVEL = 0.1f;
+    private static final float REDUCED_BATTERY_LEVEL = 0.2f;
 
     private final Map<AvroTopic<ObservationKey, ? extends SpecificRecord>, DataCache<ObservationKey, ? extends SpecificRecord>> tables = new ConcurrentHashMap<>();
     private final Map<String, DataCache<ObservationKey, ? extends SpecificRecord>> tablesByName = new ConcurrentHashMap<>();
@@ -70,6 +71,7 @@ public class TableDataHandler implements DataHandler<ObservationKey, SpecificRec
     private final NetworkConnectedReceiver networkConnectedReceiver;
     private final AtomicBoolean sendOnlyWithWifi;
     private final Context context;
+    private final SpecificData specificData;
     private int maxBytes;
     private AppAuthState authState;
     private ServerConfig kafkaConfig;
@@ -107,6 +109,7 @@ public class TableDataHandler implements DataHandler<ObservationKey, SpecificRec
         this.sendOnlyWithWifi = new AtomicBoolean(sendOnlyWithWifi);
         this.useCompression = false;
         this.authState = authState;
+        this.specificData = CacheStore.getInstance().getSpecificData();
 
         dataRetention = new AtomicLong(DATA_RETENTION_DEFAULT);
 
@@ -245,9 +248,12 @@ public class TableDataHandler implements DataHandler<ObservationKey, SpecificRec
      * Try to submit given data. This will only send data if the submitter is active and there is
      * a connection with the server. Otherwise, the data is discarded.
      */
-    public synchronized boolean trySend(AvroTopic topic, ObservationKey deviceId,
-                                        SpecificRecord record) {
-        return submitter != null && submitter.trySend(topic, deviceId, record);
+    @SuppressWarnings("UnusedReturnValue")
+    public boolean trySend(AvroTopic topic, ObservationKey key, SpecificRecord value) {
+        checkRecord(topic, key, value);
+        synchronized (this) {
+            return submitter != null && submitter.trySend(topic, key, value);
+        }
     }
 
     /**
@@ -283,7 +289,16 @@ public class TableDataHandler implements DataHandler<ObservationKey, SpecificRec
 
     @Override
     public <W extends SpecificRecord> void addMeasurement(AvroTopic<ObservationKey, W> topic, ObservationKey key, W value) {
+        checkRecord(topic, key, value);
         getCache(topic).addMeasurement(key, value);
+    }
+
+    private void checkRecord(AvroTopic topic, ObservationKey key, SpecificRecord value) {
+        if (!specificData.validate(topic.getKeySchema(), key)
+                || !specificData.validate(topic.getValueSchema(), value)) {
+            throw new IllegalArgumentException("Cannot send invalid record to topic " + topic
+                    + " with {key: " + key + ", value: " + value + "}");
+        }
     }
 
     @Override

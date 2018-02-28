@@ -302,7 +302,7 @@ public class KafkaDataSubmitter<V> implements Closeable {
         List<Record<ObservationKey, V>> measurements = listPool.get(Collections
                 .<Record<ObservationKey,V>>emptyList());
         for (Record<ObservationKey, V> record : unfilteredMeasurements) {
-            if (record.key.getUserId().equals(userId)) {
+            if (record != null && record.key.getUserId().equals(userId)) {
                 measurements.add(record);
             }
         }

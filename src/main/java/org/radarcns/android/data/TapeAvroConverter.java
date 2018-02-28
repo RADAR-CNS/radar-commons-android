@@ -16,10 +16,12 @@
 
 package org.radarcns.android.data;
 
+import org.apache.avro.Schema;
 import org.apache.avro.io.BinaryDecoder;
 import org.apache.avro.io.BinaryEncoder;
 import org.apache.avro.io.DecoderFactory;
 import org.apache.avro.io.EncoderFactory;
+import org.apache.avro.specific.SpecificData;
 import org.apache.avro.specific.SpecificDatumReader;
 import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.avro.specific.SpecificRecord;
@@ -43,16 +45,24 @@ public class TapeAvroConverter<K extends SpecificRecord, V extends SpecificRecor
     private final SpecificDatumWriter<V> valueWriter;
     private final SpecificDatumReader<K> keyReader;
     private final SpecificDatumReader<V> valueReader;
+    private final SpecificData specificData;
+    private final String topicName;
+    private final Schema keySchema;
+    private final Schema valueSchema;
     private BinaryEncoder encoder;
     private BinaryDecoder decoder;
 
-    public TapeAvroConverter(AvroTopic<K, V> topic) throws IOException {
+    public TapeAvroConverter(AvroTopic<K, V> topic, SpecificData specificData) throws IOException {
+        this.specificData = specificData;
+        topicName = topic.getName();
         encoderFactory = EncoderFactory.get();
         decoderFactory = DecoderFactory.get();
-        keyWriter = new SpecificDatumWriter<>(topic.getKeySchema());
-        valueWriter = new SpecificDatumWriter<>(topic.getValueSchema());
-        keyReader = new SpecificDatumReader<>(topic.getKeySchema());
-        valueReader = new SpecificDatumReader<>(topic.getValueSchema());
+        keySchema = topic.getKeySchema();
+        valueSchema = topic.getValueSchema();
+        keyWriter = new SpecificDatumWriter<>(keySchema, specificData);
+        valueWriter = new SpecificDatumWriter<>(valueSchema, specificData);
+        keyReader = new SpecificDatumReader<>(keySchema, keySchema, specificData);
+        valueReader = new SpecificDatumReader<>(valueSchema, valueSchema, specificData);
         encoder = null;
         decoder = null;
     }
@@ -66,13 +76,21 @@ public class TapeAvroConverter<K extends SpecificRecord, V extends SpecificRecor
 
         decoder = decoderFactory.binaryDecoder(in, decoder);
 
+        K key;
+        V value;
         try {
-            K key = keyReader.read(null, decoder);
-            V value = valueReader.read(null, decoder);
-            return new Record<>(key, value);
+            key = keyReader.read(null, decoder);
+            value = valueReader.read(null, decoder);
         } catch (RuntimeException ex) {
             throw new IOException("Failed to deserialize object", ex);
         }
+
+        if (!specificData.validate(keySchema, key)
+                || !specificData.validate(valueSchema, value)) {
+            throw new IllegalArgumentException("Failed to validate given record in topic "
+                    + topicName + "\n\tkey: " + key + "\n\tvalue: " + value);
+        }
+        return new Record<>(key, value);
     }
 
     public void serialize(Record<K, V> o, OutputStream out) throws IOException {
