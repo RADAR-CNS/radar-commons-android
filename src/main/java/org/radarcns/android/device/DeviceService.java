@@ -609,6 +609,9 @@ public abstract class DeviceService<T extends BaseDeviceState> extends Service i
                 }
                 key.setSourceId(source.getSourceId());
             }
+        }
+        if (sourceIdHint != null && !source.getSourceId().equals(sourceIdHint)) {
+            source.setSourceId(sourceIdHint);
             key.setSourceId(source.getSourceId());
         }
         DeviceManager<T> localManager = getDeviceManager();
