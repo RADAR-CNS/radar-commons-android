@@ -1,2 +1,4 @@
 <resources>
+    <string name="callback_redirect_response">Open pRMT Callback</string>
+    <string name="custom_redirect_response">Open pRMT App</string>
 </resources>

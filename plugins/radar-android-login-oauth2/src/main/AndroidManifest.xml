@@ -1,1 +1,41 @@
-<manifest/>
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application>
+
+        <activity android:name="net.openid.appauth.RedirectUriReceiverActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            tools:node="replace">
+
+            <intent-filter
+                android:label="@string/callback_redirect_response"
+                android:autoVerify="true"
+                >
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data
+                    android:scheme="https"
+                    android:host="radar-base.org"
+                    android:path="/prmt/oauth/callback"/>
+            </intent-filter>
+            <intent-filter
+                android:label="@string/custom_redirect_response"
+                android:autoVerify="true"
+                >
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data
+                    android:scheme="org.radarbase.prmt"
+                    android:host="radar-base.org"
+                    android:path="/prmt/oauth/callback"/>
+            </intent-filter>
+
+        </activity>
+
+    </application>
+
+</manifest>

@@ -2,7 +2,7 @@ apply from: "$rootDir/gradle/android.gradle"
 
 android {
     namespace "org.radarbase.android.auth.oauth2"
-    defaultConfig.manifestPlaceholders = ["appAuthRedirectScheme": "org.radarbase.android"]
+    defaultConfig.manifestPlaceholders = ["appAuthRedirectScheme": "https"]
 }
 
 description = "RADAR Android OAuth2 LoginManager."
