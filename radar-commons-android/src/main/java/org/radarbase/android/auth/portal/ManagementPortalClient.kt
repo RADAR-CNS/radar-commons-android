@@ -1,36 +1,72 @@
 package org.radarbase.android.auth.portal
 
-import okhttp3.Credentials
-import okhttp3.FormBody
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import io.ktor.client.*
+import io.ktor.client.call.*
+import io.ktor.client.plugins.*
+import io.ktor.client.plugins.auth.*
+import io.ktor.client.plugins.auth.providers.*
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.client.request.*
+import io.ktor.client.request.forms.*
+import io.ktor.client.statement.*
+import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
+import kotlinx.serialization.json.Json
 import org.json.JSONException
 import org.json.JSONObject
 import org.radarbase.android.auth.AppAuthState
 import org.radarbase.android.auth.AuthStringParser
 import org.radarbase.android.auth.SourceMetadata
-import org.radarbase.android.auth.SourceMetadata.Companion.optNonEmptyString
-import org.radarbase.android.util.Parser
+import org.radarbase.android.util.*
+import org.radarbase.android.util.buildJson
+import org.radarbase.android.util.optNonEmptyString
+import org.radarbase.android.util.toJson
+import org.radarbase.android.util.toStringMap
 import org.radarbase.config.ServerConfig
 import org.radarbase.producer.AuthenticationException
-import org.radarbase.producer.rest.RestClient
 import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.lang.RuntimeException
 import java.net.MalformedURLException
 
-class ManagementPortalClient constructor(
-    managementPortal: ServerConfig,
-    clientId: String,
-    clientSecret: String,
-    client: RestClient? = null,
-) {
-    val client: RestClient = (client?.newBuilder() ?: RestClient.newClient())
-            .server(managementPortal)
-            .build()
+/**
+ * Client for interacting with the Management Portal to authenticate and manage users and devices.
+ * This class handles requests related to authentication, user retrieval, source registration, and
+ * source updates.
+ *
+ * This client uses the Ktor HTTP client for making requests, and handles different types of
+ * JSON responses from the Management Portal.
+ *
+ * It expects a [ServerConfig] instance to define the Management Portal URL and handles
+ * basic authentication using client credentials (client ID and secret).
+ *
+ * Operations in this class include:
+ *
+ *     Getting a refresh token from a meta-token URL.
+ *     Fetching subject information such as project details, available source types, and
+ *     assigned sources.
+ *     Registering and updating sources linked to a subject.
+ * </ul>
+ */
 
-    private val credentials = Credentials.basic(clientId, clientSecret)
+class ManagementPortalClient(
+    managementPortal: ServerConfig,
+    private val clientId: String,
+    private val clientSecret: String,
+    client: HttpClient,
+) {
+    val client: HttpClient = client.config {
+        install(ContentNegotiation) {
+            json(Json {
+                ignoreUnknownKeys = true
+                coerceInputValues = true
+            })
+        }
+        defaultRequest {
+            url(managementPortal.urlString)
+            accept(ContentType.Application.Json)
+        }
+    }
 
     /**
      * Get refresh-token from meta-token url.
@@ -40,12 +76,10 @@ class ManagementPortalClient constructor(
      * response.
      */
     @Throws(IOException::class)
-    fun getRefreshToken(metaTokenUrl: String, parser: AuthStringParser): AppAuthState {
-        val request = client.requestBuilder(metaTokenUrl)
-                .header("Accept", APPLICATION_JSON)
-                .build()
-
-        logger.debug("Requesting refreshToken with token-url {}", metaTokenUrl)
+    suspend fun getRefreshToken(metaTokenUrl: String, parser: AuthStringParser): AppAuthState.Builder {
+        val request = client.prepareRequest(metaTokenUrl) {
+            logger.debug("Requesting refreshToken with token-url {}", metaTokenUrl)
+        }
 
         return handleRequest(request, parser)
     }
@@ -58,61 +92,88 @@ class ManagementPortalClient constructor(
      * response.
      */
     @Throws(IOException::class)
-    fun getSubject(state: AppAuthState, parser: AuthStringParser): AppAuthState {
+    suspend fun getSubject(state: AppAuthState.Builder, parser: AuthStringParser): AppAuthState.Builder {
         if (state.userId == null) {
             throw IOException("Authentication state does not contain user ID")
         }
-        val request = client.requestBuilder("api/subjects/${state.userId}")
-                .headers(state.okHttpHeaders)
-                .header("Accept", APPLICATION_JSON)
-                .build()
+        val ktorHeaders: Headers = Headers.build {
+            state.headers.forEach { (k, v) -> append(k, v) }
+        }
+
+        val request = client.prepareRequest("api/subjects/${state.userId}") {
+            headers {
+                appendAll(ktorHeaders)
+                append(HttpHeaders.Accept, APPLICATION_JSON)
+            }
+        }
 
         logger.info("Requesting subject {} with parseHeaders {}", state.userId,
-                state.okHttpHeaders)
+                ktorHeaders)
 
         return handleRequest(request, parser)
     }
 
-    /** Register a source with the Management Portal.  */
+    /**
+     * Registers a source in the Management Portal for the specified subject.
+     *
+     * @param auth the current authentication state
+     * @param source the [SourceMetadata] of the source to register
+     * @return the registered [SourceMetadata], with updated information
+     * @throws IOException if the request fails
+     * @throws JSONException if the response cannot be parsed as valid JSON
+     */
     @Throws(IOException::class, JSONException::class)
-    fun registerSource(auth: AppAuthState, source: SourceMetadata): SourceMetadata = handleSourceUpdateRequest(
+    suspend fun registerSource(auth: AppAuthState, source: SourceMetadata): SourceMetadata =
+        handleSourceUpdateRequest(
         auth,
         "api/subjects/${auth.userId}/sources",
         sourceRegistrationBody(source),
         source,
     )
 
-    /** Register a source with the Management Portal.  */
+    /**
+     * Updates the metadata of a registered source in the Management Portal.
+     *
+     * @param auth the current authentication state
+     * @param source the [SourceMetadata] of the source to update
+     * @return the [SourceMetadata], with updated information
+     * @throws IOException if the request fails
+     * @throws JSONException if the response cannot be parsed as valid JSON
+     */
     @Throws(IOException::class, JSONException::class)
-    fun updateSource(auth: AppAuthState, source: SourceMetadata): SourceMetadata = handleSourceUpdateRequest(
+    suspend fun updateSource(auth: AppAuthState, source: SourceMetadata): SourceMetadata =
+        handleSourceUpdateRequest(
         auth,
         "api/subjects/${auth.userId}/sources/${source.sourceName}",
         sourceUpdateBody(source),
         source,
     )
 
-    private fun handleSourceUpdateRequest(
+    private suspend fun handleSourceUpdateRequest(
         auth: AppAuthState,
         relativePath: String,
         requestBody: JSONObject,
         source: SourceMetadata,
     ): SourceMetadata {
-        val request = client.requestBuilder(relativePath)
-            .post(requestBody.toString().toRequestBody(APPLICATION_JSON_TYPE))
-            .headers(auth.okHttpHeaders)
-            .header("Content-Type", APPLICATION_JSON_UTF8)
-            .header("Accept", APPLICATION_JSON)
-            .build()
+        val response = client.post(relativePath) {
+            contentType(ContentType.Application.Json)
+            headers {
+                appendAll(auth.ktorHeaders)
+                append(HttpHeaders.ContentType, APPLICATION_JSON)
+                append(HttpHeaders.Accept, APPLICATION_JSON)
+            }
+            setBody(requestBody)
+        }
+        val responseBody = response.bodyAsText()
+        if (responseBody.isEmpty()) {
+            throw IOException("Source registration with the ManagementPortal did not yield a response body.")
+        }
 
-        return client.request(request).use { response ->
-            val responseBody = RestClient.responseBody(response)
-                ?.takeIf { it.isNotEmpty() }
-                ?: throw IOException("Source registration with the ManagementPortal did not yield a response body.")
-
-            when (response.code) {
-                401 -> throw AuthenticationException("Authentication failure with the ManagementPortal: $responseBody")
-                403 -> throw UnsupportedOperationException("Not allowed to update source data: $responseBody")
-                404 -> {
+        if (!response.status.isSuccess()) {
+            when (response.status) {
+                HttpStatusCode.Unauthorized -> throw AuthenticationException("Authentication failure with the ManagementPortal: $responseBody")
+                HttpStatusCode.Forbidden -> throw UnsupportedOperationException("Not allowed to update source data: $responseBody")
+                HttpStatusCode.NotFound -> {
                     val error = JSONObject(responseBody)
                     if (error.getString("message").contains("source", true)) {
                         throw SourceNotFoundException("Source ${source.sourceId} is no longer registered with the ManagementPortal: $responseBody")
@@ -120,31 +181,37 @@ class ManagementPortalClient constructor(
                         throw UserNotFoundException("User ${auth.userId} is no longer registered with the ManagementPortal: $responseBody")
                     }
                 }
-                409 -> throw ConflictException("Source registration conflicts with existing source registration: $responseBody")
-                in 400..599 -> throw IOException("Cannot complete source registration with the ManagementPortal: $responseBody, using request $requestBody")
+                HttpStatusCode.Conflict -> throw ConflictException("Source registration conflicts with existing source registration: $responseBody")
+                else -> throw IOException("Cannot complete source registration with the ManagementPortal: $responseBody, using request $requestBody")
             }
-
-            parseSourceRegistration(responseBody, source)
-            source
         }
+
+        parseSourceRegistration(responseBody, source)
+        return source
     }
 
+    /**
+     * Exchanges access-token from refresh-token using the refresh token stored in the [AppAuthState.Builder].
+     *
+     * @param authState the current [AppAuthState] builder
+     * @param parser an [AuthStringParser] specifically [AccessTokenParser]  to parse the response
+     * @return the updated [AppAuthState.Builder] with the access token, updated headers and source information
+     * @throws IOException if the request fails or the refresh token is missing
+     */
     @Throws(IOException::class)
-    fun refreshToken(authState: AppAuthState, parser: AuthStringParser): AppAuthState {
+    suspend fun refreshToken(authState: AppAuthState.Builder, parser: AuthStringParser): AppAuthState.Builder {
         try {
-            val refreshToken = requireNotNull(authState.getAttribute(MP_REFRESH_TOKEN_PROPERTY)) {
+            val refreshToken = requireNotNull(authState.attributes[MP_REFRESH_TOKEN_PROPERTY]) {
                 "No refresh token found"
             }
 
-            val body = FormBody.Builder()
-                    .add("grant_type", "refresh_token")
-                    .add("refresh_token", refreshToken)
-                    .build()
-
-            val request = client.requestBuilder("oauth/token")
-                    .post(body)
-                    .addHeader("Authorization", credentials)
-                    .build()
+            val request = client.preparePost("oauth/token") {
+                setBody(formData {
+                    append("grant_type", "refresh_token")
+                    append("refresh_token", refreshToken)
+                })
+                basicAuth(clientId, clientSecret)
+            }
 
             return handleRequest(request, parser)
         } catch (e: MalformedURLException) {
@@ -153,16 +220,25 @@ class ManagementPortalClient constructor(
 
     }
 
+    /**
+     * Internal method to handle requests and parse responses using a generic parser.
+     *
+     * @param <T> the type of the response object
+     * @param request the prepared [HttpStatement] request
+     * @param parser the parser ([AuthStringParser]]) for processing the JSON response
+     * @return the parsed response of type [T]
+     * @throws IOException if the request fails or the response cannot be processed
+     */
     @Throws(IOException::class)
-    private fun <T> handleRequest(request: Request, parser: Parser<String, T>): T {
-        return client.request(request).use { response ->
-            val body = RestClient.responseBody(response)
-                ?.takeIf { it.isNotEmpty() }
-                ?: throw IOException("ManagementPortal did not yield a response body.")
+    private suspend fun <T> handleRequest(request: HttpStatement, parser: Parser<JSONObject, T>): T {
+        return request.execute { response ->
+            val body: JSONObject = JSONObject(response.bodyAsText())
 
-            when (response.code) {
-                401 -> throw AuthenticationException("QR code is invalid: $body")
-                in 400 .. 599 -> throw IOException("Failed to make request; response $body")
+            if (response.status == HttpStatusCode.Unauthorized) {
+                throw AuthenticationException("QR code is invalid: $body")
+            }
+            if (!response.status.isSuccess()) {
+                throw IOException("Failed to make request; response $body")
             }
 
             parser.parse(body)
@@ -176,8 +252,6 @@ class ManagementPortalClient constructor(
         const val SOURCE_IDS_PROPERTY = "org.radarcns.android.auth.portal.ManagementPortalClient.sourceIds"
         const val MP_REFRESH_TOKEN_PROPERTY = "org.radarcns.android.auth.portal.ManagementPortalClient.refreshToken"
         private const val APPLICATION_JSON = "application/json"
-        private const val APPLICATION_JSON_UTF8 = "$APPLICATION_JSON; charset=utf-8"
-        private val APPLICATION_JSON_TYPE = APPLICATION_JSON_UTF8.toMediaType()
         private val illegalSourceCharacters = "[^_'.@A-Za-z0-9- ]+".toRegex()
 
         @Throws(JSONException::class)
@@ -194,22 +268,14 @@ class ManagementPortalClient constructor(
             }
             val sourceAttributes = source.attributes
             if (sourceAttributes.isNotEmpty()) {
-                val attrs = JSONObject()
-                for ((key, value) in sourceAttributes) {
-                    attrs.put(key, value)
-                }
-                requestBody.put("attributes", attrs)
+                requestBody.put("attributes", sourceAttributes.toJson())
             }
             return requestBody
         }
 
         @Throws(JSONException::class)
-        internal fun sourceUpdateBody(source: SourceMetadata): JSONObject {
-            return JSONObject().apply {
-                for ((key, value) in source.attributes) {
-                    put(key, value)
-                }
-            }
+        internal fun sourceUpdateBody(source: SourceMetadata): JSONObject = buildJson {
+            putAll(source.attributes)
         }
 
         /**
@@ -222,11 +288,13 @@ class ManagementPortalClient constructor(
         internal fun parseSourceRegistration(body: String, source: SourceMetadata) {
             logger.debug("Parsing source from {}", body)
             val responseObject = JSONObject(body)
-            source.sourceId = responseObject.getString("sourceId")
-            source.sourceName = responseObject.optNonEmptyString("sourceName") ?: source.sourceId
-            source.expectedSourceName = responseObject.optNonEmptyString("expectedSourceName")
-            source.attributes = GetSubjectParser.attributesToMap(
-                    responseObject.optJSONObject("attributes"))
+            source.apply {
+                sourceId = responseObject.getString("sourceId")
+                sourceName = responseObject.optNonEmptyString("sourceName") ?: source.sourceId
+                expectedSourceName = responseObject.optNonEmptyString("expectedSourceName")
+                attributes = responseObject.optJSONObject("attributes")?.toStringMap()
+                    ?: emptyMap()
+            }
         }
 
         class SourceNotFoundException(message: String) : RuntimeException(message)

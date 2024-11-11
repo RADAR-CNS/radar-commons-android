@@ -32,9 +32,10 @@ import java.util.*
  * @param deserializer way to deserialize to objects from a stream
  */
 class BackedObjectQueue<S, T>(
-        private val queueFile: QueueFile,
-        private val serializer: Serializer<S>,
-        private val deserializer: Deserializer<T>) : Closeable {
+    private val queueFile: QueueFile,
+    private val serializer: Serializer<S>,
+    private val deserializer: Deserializer<T>
+) : Closeable {
 
     /** Returns `true` if this queue contains no entries.  */
     val isEmpty: Boolean

@@ -20,11 +20,19 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.google.android.gms.location.ActivityTransitionResult
+import org.radarbase.android.util.CoroutineTaskExecutor
 
-class ActivityTransitionReceiver(private val googleActivityManager: GoogleActivityManager) : BroadcastReceiver() {
+class ActivityTransitionReceiver(
+    private val googleActivityManager: GoogleActivityManager,
+    private val activityTaskExecutor: CoroutineTaskExecutor
+) : BroadcastReceiver() {
 
     override fun onReceive(context: Context?, intent: Intent?) {
         intent ?: return
-        if (ActivityTransitionResult.hasResult(intent)) googleActivityManager.sendActivityTransitionUpdates(intent)
+        if (ActivityTransitionResult.hasResult(intent)) {
+            activityTaskExecutor.execute {
+                googleActivityManager.sendActivityTransitionUpdates(intent)
+            }
+        }
     }
 }

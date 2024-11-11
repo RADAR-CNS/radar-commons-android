@@ -27,20 +27,24 @@ import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.BaseSourceState
 import org.radarbase.android.source.SourceStatusListener
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.OfflineProcessor
 import org.radarcns.kafka.ObservationKey
 import org.radarcns.passive.phone.PhoneContactList
-import java.util.*
 import java.util.concurrent.TimeUnit
-import kotlin.collections.ArrayList
 import kotlin.collections.LinkedHashSet
 
 class PhoneContactListManager(service: PhoneContactsListService) : AbstractSourceManager<PhoneContactsListService, BaseSourceState>(service) {
     private val preferences: SharedPreferences = service.getSharedPreferences(PhoneContactListManager::class.java.name, Context.MODE_PRIVATE)
-    private val contactsTopic: DataCache<ObservationKey, PhoneContactList> = createCache("android_phone_contacts", PhoneContactList())
+    private val contactsTopic: DataCache<ObservationKey, PhoneContactList> = createCache(
+        "android_phone_contacts",
+        PhoneContactList()
+    )
     private val processor: OfflineProcessor
     private val db: ContentResolver = service.contentResolver
     private var savedContactLookups: Set<String> = emptySet()
+
+    private val contactsTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
 
     init {
         name = service.getString(R.string.contact_list)
@@ -50,6 +54,7 @@ class PhoneContactListManager(service: PhoneContactsListService) : AbstractSourc
             requestName = ACTION_UPDATE_CONTACTS_LIST
             wake = false
         }
+        contactsTaskExecutor.start()
     }
 
     override fun start(acceptableIds: Set<String>) {
@@ -111,7 +116,9 @@ class PhoneContactListManager(service: PhoneContactsListService) : AbstractSourc
     }
 
     override fun onClose() {
-        processor.close()
+        contactsTaskExecutor.stop {
+            processor.stop()
+        }
     }
 
     private fun makeQuery(
@@ -135,7 +142,7 @@ class PhoneContactListManager(service: PhoneContactsListService) : AbstractSourc
         }
     }
 
-    private fun processContacts() {
+    private suspend fun processContacts() {
         val newContactLookups = queryContacts() ?: return
 
         var added: Int? = null

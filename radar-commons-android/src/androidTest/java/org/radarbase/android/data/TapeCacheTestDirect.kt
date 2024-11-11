@@ -18,6 +18,7 @@ package org.radarbase.android.data
 
 import android.os.Process.THREAD_PRIORITY_BACKGROUND
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import kotlinx.coroutines.test.runTest
 import org.apache.avro.generic.GenericRecord
 import org.junit.After
 import org.junit.Assert.*
@@ -39,7 +40,6 @@ import java.util.concurrent.ThreadLocalRandom
 
 @RunWith(AndroidJUnit4::class)
 class TapeCacheTestDirect {
-    private lateinit var handler: SafeHandler
     private lateinit var tapeCache: TapeCache<ObservationKey, ApplicationUptime>
     private lateinit var key: ObservationKey
     private lateinit var value: ApplicationUptime
@@ -59,7 +59,7 @@ class TapeCacheTestDirect {
                     Any::class.java, Any::class.java)
 
             return TapeCache(
-                    folder.newFile(), topic, outputTopic, handler, serializationFactory,
+                    folder.newFile(), topic, outputTopic, serializationFactory,
                     CacheConfiguration(100L))
         }
 
@@ -74,11 +74,8 @@ class TapeCacheTestDirect {
                 ObservationKey.getClassSchema(), ApplicationUptime.getClassSchema(),
                 Any::class.java, Any::class.java)
 
-        handler = SafeHandler("TapeCacheTest", THREAD_PRIORITY_BACKGROUND).apply {
-            start()
-        }
         tapeCache = TapeCache(folder.newFile(), topic,
-                outputTopic, handler, serializationFactory,
+                outputTopic, serializationFactory,
                 CacheConfiguration(100, 4096, CacheConfiguration.QueueFileFactory.DIRECT))
 
         key = ObservationKey("test", "a", "b")
@@ -88,12 +85,11 @@ class TapeCacheTestDirect {
 
     @After
     @Throws(IOException::class)
-    fun tearDown() {
-        tapeCache.close()
-        handler.stop {  }
+    fun tearDown() = runTest {
+        tapeCache.stop()
     }
 
-    fun addMultipleMeasurements() {
+    fun addMultipleMeasurements() = runTest {
         assertNull(tapeCache.getUnsentRecords(100, SIZE_LIMIT_DEFAULT))
         assertEquals(0L, tapeCache.numberOfRecords)
         assertNull(tapeCache.getRecords(100))
@@ -123,7 +119,7 @@ class TapeCacheTestDirect {
 
     @Test
     @Throws(Exception::class)
-    fun addMeasurement() {
+    fun addMeasurement() = runTest {
         assertNull(tapeCache.getUnsentRecords(100, SIZE_LIMIT_DEFAULT))
         assertEquals(0L, tapeCache.numberOfRecords)
         assertNull(tapeCache.getRecords(100))
@@ -163,7 +159,7 @@ class TapeCacheTestDirect {
 
     @Test
     @Throws(IOException::class)
-    fun testBinaryObject() {
+    fun testBinaryObject() = runTest {
         val localTapeCache = audioCache
 
         val localValue = getRecording(176482)
@@ -190,7 +186,7 @@ class TapeCacheTestDirect {
 
     @Test
     @Throws(IOException::class)
-    fun testMaxUnsentObject() {
+    fun testMaxUnsentObject() = runTest {
         val localTapeCache = audioCache
 
         localTapeCache.addMeasurement(key, getRecording(100000))
@@ -209,7 +205,7 @@ class TapeCacheTestDirect {
 
     @Test
     @Throws(Exception::class)
-    fun flush() {
+    fun flush() = runTest {
         assertNull(tapeCache.getUnsentRecords(100, SIZE_LIMIT_DEFAULT))
         assertEquals(0L, tapeCache.numberOfRecords)
         assertNull(tapeCache.getRecords(100))

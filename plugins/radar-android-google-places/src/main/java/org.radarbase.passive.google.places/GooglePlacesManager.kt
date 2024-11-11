@@ -37,8 +37,8 @@ import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.SourceStatusListener
 import org.radarbase.android.util.BroadcastRegistration
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.OfflineProcessor
-import org.radarbase.android.util.SafeHandler
 import org.radarbase.android.util.register
 import org.radarbase.passive.google.places.GooglePlacesService.Companion.GOOGLE_PLACES_API_KEY_DEFAULT
 import org.radarcns.kafka.ObservationKey
@@ -48,8 +48,11 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.pow
 
-class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized private var apiKey: String, private val placeHandler: SafeHandler) : AbstractSourceManager<GooglePlacesService, GooglePlacesState>(service) {
-    private val placesInfoTopic: DataCache<ObservationKey, GooglePlacesInfo> = createCache("android_google_places_info", GooglePlacesInfo())
+class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized private var apiKey: String, private val placeExecutor: CoroutineTaskExecutor) : AbstractSourceManager<GooglePlacesService, GooglePlacesState>(service) {
+    private val placesInfoTopic: DataCache<ObservationKey, GooglePlacesInfo> = createCache(
+        "android_google_places_info",
+        GooglePlacesInfo()
+    )
 
     private val placesProcessor: OfflineProcessor
     // Delay in seconds for exponential backoff
@@ -107,7 +110,7 @@ class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized priva
         register()
         status = SourceStatusListener.Status.READY
         placesProcessor.start()
-        placeHandler.execute { if (!placesClientCreated) {
+        placeExecutor.execute { if (!placesClientCreated) {
             service.createPlacesClient()
         }
         if (!placesClientCreated && !Places.isInitialized()) {
@@ -116,7 +119,7 @@ class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized priva
         updateConnected()
         placesBroadcastReceiver = service.broadcaster?.register(DEVICE_LOCATION_CHANGED) { _, _ ->
             if (placesClientCreated) {
-                placeHandler.execute {
+                placeExecutor.execute {
                     state.fromBroadcast.set(true)
                     processPlacesData()
                     state.fromBroadcast.set(false)
@@ -164,10 +167,9 @@ class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized priva
         }
     }
 
-    @Synchronized
     @SuppressLint("MissingPermission")
-    private fun processPlacesData() {
-        placeHandler.execute {
+    private suspend fun processPlacesData() {
+        placeExecutor.execute {
             if (isPermissionGranted) {
                 val client = placesClient ?: return@execute
                 currentPlaceRequest = FindCurrentPlaceRequest.newInstance(currentPlaceFields)
@@ -240,13 +242,16 @@ class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized priva
                                 val city = findComponent(addressComponents, CITY_KEY)
                                 val state = findComponent(addressComponents, STATE_KEY)
                                 val country = findComponent(addressComponents, COUNTRY_KEY)
-                                send(placesInfoTopic, placesInfoBuilder.apply {
-                                    this.city = city
-                                    this.state = state
-                                    this.country = country
-                                    this.placeId = it }.build())
-                                updateRecentlySent()
-                                logger.info("Google Places data with additional info sent")
+                                placeExecutor.execute {
+                                    send(placesInfoTopic, placesInfoBuilder.apply {
+                                        this.city = city
+                                        this.state = state
+                                        this.country = country
+                                        this.placeId = it
+                                    }.build())
+                                    updateRecentlySent()
+                                    logger.info("Google Places data with additional info sent")
+                                }
                             }
                             .addOnFailureListener { ex ->
                                 when (ex.javaClass) {
@@ -255,14 +260,21 @@ class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized priva
                                         handleApiException(exception, exception.statusCode)
                                     }
                                     else -> {
-                                        send(placesInfoTopic, placesInfoBuilder.apply { this.placeId = it }.build())
-                                        logger.info("Google Places data sent")
+                                        placeExecutor.execute {
+                                            send(placesInfoTopic,
+                                                placesInfoBuilder.apply { this.placeId = it }
+                                                    .build()
+                                            )
+                                            logger.info("Google Places data sent")
+                                        }
                                     }
                                 }
                             }
                 }
             } else {
+                placeExecutor.execute {
                     send(placesInfoTopic, placesInfoBuilder.build())
+                }
             }
         }
     }
@@ -272,7 +284,7 @@ class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized priva
      */
     private fun updateRecentlySent() {
         isRecentlySent.set(true)
-        placeHandler.delay(additionalFetchDelay) {
+        placeExecutor.delay(additionalFetchDelay) {
             isRecentlySent.set(false)
         }
     }
@@ -315,7 +327,7 @@ class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized priva
 
     override fun onClose() {
             val currentDelay = (baseDelay + 2.0.pow(service.numOfAttempts)).toLong()
-            placeHandler.execute {
+            placeExecutor.execute {
                 if (currentDelay < maxDelay) {
                     service.numOfAttempts++
                     service.preferences
@@ -330,7 +342,7 @@ class GooglePlacesManager(service: GooglePlacesService, @get: Synchronized priva
                 placesBroadcastReceiver = null
 // Not using Places.deinitialize for now as it may prevent PlacesClient from being created during a plugin reload. Additionally, multiple calls to Places.initialize do not impact memory or CPU.
 //                Places.deinitialize()
-                placesProcessor.close()
+                placesProcessor.stop()
             }
     }
 

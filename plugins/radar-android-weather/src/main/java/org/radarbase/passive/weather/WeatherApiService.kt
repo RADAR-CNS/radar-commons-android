@@ -16,28 +16,25 @@
 
 package org.radarbase.passive.weather
 
-import okhttp3.OkHttpClient
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.cio.CIO
 import org.radarbase.android.config.SingleRadarConfiguration
 import org.radarbase.android.source.BaseSourceState
 import org.radarbase.android.source.SourceManager
 import org.radarbase.android.source.SourceService
 import org.radarbase.config.ServerConfig
 import org.radarbase.passive.weather.WeatherApiManager.Companion.SOURCE_OPENWEATHERMAP
-import org.radarbase.producer.rest.RestClient
 import java.util.concurrent.TimeUnit
 
 class WeatherApiService : SourceService<BaseSourceState>() {
-    private lateinit var client: OkHttpClient
+    private lateinit var client: HttpClient
 
     override val defaultState: BaseSourceState
         get() = BaseSourceState()
 
     override fun onCreate() {
         super.onCreate()
-        client = RestClient.global()
-                .server(ServerConfig())
-                .build()
-                .httpClient  // global OkHttpClient
+        client = HttpClient(CIO)
     }
 
     override fun createSourceManager() = WeatherApiManager(this, client)
@@ -49,6 +46,11 @@ class WeatherApiService : SourceService<BaseSourceState>() {
             config.getString(WEATHER_API_SOURCE, WEATHER_API_SOURCE_DEFAULT),
             config.optString(WEATHER_API_KEY),
         )
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        client.close()
     }
 
     companion object {

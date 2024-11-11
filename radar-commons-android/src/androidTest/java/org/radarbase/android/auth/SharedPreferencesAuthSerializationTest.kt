@@ -3,6 +3,7 @@ package org.radarbase.android.auth
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -38,7 +39,7 @@ class SharedPreferencesAuthSerializationTest {
     }
 
     @Test
-    fun addToPreferences() {
+    fun addToPreferences() = runTest{
         val readState = ApplicationProvider.getApplicationContext<Context>().let { context ->
             val authSerializer = SharedPreferencesAuthSerialization(context)
             authSerializer.store(state)
@@ -57,7 +58,7 @@ class SharedPreferencesAuthSerializationTest {
         assertTrue(state.isValidFor(9, TimeUnit.SECONDS))
         assertFalse(state.isValidFor(11, TimeUnit.SECONDS))
         assertEquals(LoginManager.AUTH_TYPE_BEARER.toLong(), state.tokenType.toLong())
-        assertEquals("Bearer abcd", state.headers[0].value)
+        assertEquals("Bearer abcd", state.headers[0].second)
         assertEquals(sources, state.sourceMetadata)
     }
 }

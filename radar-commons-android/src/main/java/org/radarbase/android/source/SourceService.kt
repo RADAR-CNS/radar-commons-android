@@ -1,4 +1,4 @@
-/*
+    /*
  * Copyright 2017 The Hyve
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,11 +18,17 @@ package org.radarbase.android.source
 
 import android.content.Intent
 import android.os.Bundle
-import android.os.Process.THREAD_PRIORITY_BACKGROUND
 import androidx.annotation.CallSuper
 import androidx.annotation.Keep
 import androidx.lifecycle.LifecycleService
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.launch
 import org.apache.avro.specific.SpecificRecord
 import org.radarbase.android.RadarApplication.Companion.radarApp
 import org.radarbase.android.RadarApplication.Companion.radarConfig
@@ -36,25 +42,27 @@ import org.radarbase.android.source.SourceProvider.Companion.PLUGIN_NAME_KEY
 import org.radarbase.android.source.SourceProvider.Companion.PRODUCER_KEY
 import org.radarbase.android.util.BluetoothStateReceiver.Companion.bluetoothIsEnabled
 import org.radarbase.android.util.BundleSerialization
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.ManagedServiceConnection
-import org.radarbase.android.util.SafeHandler
-import org.radarbase.android.util.send
+import org.radarbase.android.util.ManagedServiceConnection.Companion.serviceConnection
+import org.radarbase.kotlin.coroutines.launchJoin
 import org.radarcns.kafka.ObservationKey
 import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
-import kotlin.collections.HashSet
 
-/**
+    /**
  * A service that manages a SourceManager and a TableDataHandler to send addToPreferences the data of a
  * wearable device, phone or API and send it to a Kafka REST proxy.
  *
  * Specific wearables should extend this class.
  */
 @Keep
-abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceStatusListener, LoginListener {
-    private var registrationFuture: SafeHandler.HandlerFuture? = null
+abstract class SourceService<T : BaseSourceState> :
+    LifecycleService(), SourceStatusListener, LoginListener
+{
+    private var registrationFuture: CoroutineTaskExecutor.CoroutineFutureHandle? = null
     val key = ObservationKey()
 
     @get:Synchronized
@@ -67,6 +75,11 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
     private var hasBluetoothPermission: Boolean = false
     var sources: List<SourceMetadata> = emptyList()
     var sourceTypes: Set<SourceType> = emptySet()
+    var sourceConnectFailed: MutableSharedFlow<SourceConnectFailed> = MutableSharedFlow()
+
+    val status: MutableStateFlow<SourceStatusListener.Status> =
+        MutableStateFlow(SourceStatusListener.Status.DISCONNECTED)
+
 
     private val acceptableSourceTypes: Set<SourceType>
         get() = sourceTypes.filterTo(HashSet()) {
@@ -80,12 +93,27 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
     private val isAuthorizedForSource: Boolean
         get() = !needsRegisteredSources || acceptableSources.isNotEmpty()
 
-    private lateinit var authConnection: AuthServiceConnection
+    private lateinit var authConnection: ManagedServiceConnection<AuthService.AuthServiceBinder>
+    private var authListenerRegistry: AuthService.LoginListenerRegistry? = null
+    private val authBoundTasks: MutableList<suspend (AuthService.AuthServiceBinder) -> Unit> = mutableListOf(
+        { binder ->
+            authListenerRegistry = binder.addLoginListener(this)
+            binder.refreshIfOnline()
+        }
+    )
+
+    private val authUnboundTasks: MutableList<AuthServiceStateReactor> = mutableListOf(
+        { binder ->
+            authListenerRegistry?.let {
+                binder.removeLoginListener(it)
+            }
+        }
+    )
+    
     protected lateinit var config: RadarConfiguration
     private lateinit var radarConnection: ManagedServiceConnection<org.radarbase.android.IRadarBinder>
-    private lateinit var handler: SafeHandler
-    private var startFuture: SafeHandler.HandlerFuture? = null
-    private lateinit var broadcaster: LocalBroadcastManager
+    private lateinit var sourceServiceExecutor: CoroutineTaskExecutor
+    private var startFuture: CoroutineTaskExecutor.CoroutineFutureHandle? = null
     private var needsRegisteredSources: Boolean = true
     private lateinit var pluginName: String
     private lateinit var sourceModel: String
@@ -93,14 +121,47 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
     private val name = javaClass.simpleName
     private var delayedStart: Set<String>? = null
 
-    val state: T
-        get() {
-            return sourceManager?.state ?: defaultState.apply {
-                id.apply {
-                    setProjectId(key.getProjectId())
-                    setUserId(key.getUserId())
-                    setSourceId(key.getSourceId())
+    private var _registeredSource: SourceMetadata? = null
+
+    private var authConnectionBinder: AuthService.AuthServiceBinder? = null
+
+    var registeredSource: SourceMetadata?
+        get() = _registeredSource
+        private set(value) {
+            sourceServiceExecutor.execute { _registeredSource = value }
+        }
+
+    var manualAttributes: Map<String, String> = emptyMap()
+        set(value) {
+            if (value == field) return
+            val oldValue = field
+            field = value
+            // if the new manual attributes would change something about the old manual
+            // attributes and a source is already assigned, then update the registration
+            sourceServiceExecutor.executeReentrant {
+                val currentSource = registeredSource ?: return@executeReentrant
+                val bareAttributes = if (oldValue.isEmpty()) {
+                    currentSource.attributes
+                } else buildMap {
+                    putAll(currentSource.attributes)
+                    oldValue.keys.forEach { remove(it) }
                 }
+
+                if (bareAttributes + value != currentSource.attributes) {
+                    val currentType = currentSource.type ?: return@executeReentrant
+                    registerSource(currentSource, currentType, bareAttributes)
+                }
+            }
+
+            onManualAttributesUpdate(value)
+        }
+
+    val state: T
+        get() = sourceManager?.state ?: defaultState.apply {
+            id.apply {
+                projectId = key.projectId
+                userId = key.userId
+                sourceId = key.sourceId
             }
         }
 
@@ -121,23 +182,54 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
         super.onCreate()
         sources = emptyList()
         sourceTypes = emptySet()
-        broadcaster = LocalBroadcastManager.getInstance(this)
 
         mBinder = createBinder()
 
-        authConnection = AuthServiceConnection(this, this)
+        authConnection = serviceConnection(radarApp.authService)
+        radarConnection = serviceConnection(radarApp.radarService)
 
-        radarConnection = ManagedServiceConnection(this, radarApp.radarService)
-        radarConnection.onBoundListeners.add { binder ->
-            dataHandler = binder.dataHandler
-            handler.execute {
-                startFuture?.runNow()
+        lifecycleScope.launch {
+            launch {
+                radarConnection.state
+                    .collect { bindState ->
+                        if (bindState !is ManagedServiceConnection.BoundService) return@collect
+
+                        dataHandler = bindState.binder.dataHandler
+                        startFuture?.runNow()
+                    }
             }
+            launch {
+                authConnection.state
+                    .onEach { bindState ->
+                        when (bindState) {
+                            is ManagedServiceConnection.BoundService -> {
+                                authConnectionBinder = bindState.binder.also { binder ->
+                                    authBoundTasks.launchJoin {
+                                        it(binder)
+                                    }
+                                }
+                            }
+                            is ManagedServiceConnection.Unbound -> {
+                                authConnectionBinder?.also { binder ->
+                                    authUnboundTasks.launchJoin {
+                                        it(binder)
+                                    }
+                                }
+                                authConnectionBinder = null
+                            }
+                        }
+                    }.launchIn(this)
+            }
+            launch {
+                radarConfig.config
+                    .collectLatest {
+                        configure(it)
+                    }
+            }
+            radarConnection.bind()
         }
-        radarConnection.bind()
-        handler = SafeHandler.getInstance("SourceService-$name", THREAD_PRIORITY_BACKGROUND)
+        sourceServiceExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
 
-        radarConfig.config.observe(this, ::configure)
         config = radarConfig
 
         sourceManager = null
@@ -189,37 +281,35 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
     }
 
     override fun sourceFailedToConnect(name: String) {
-        broadcaster.send(SOURCE_CONNECT_FAILED) {
-            putExtra(SOURCE_SERVICE_CLASS, this@SourceService.javaClass.name)
-            putExtra(SOURCE_STATUS_NAME, name)
-        }
+        sourceConnectFailed.tryEmit(
+            SourceConnectFailed(
+            this@SourceService.javaClass,
+            name,
+        ))
     }
 
-    private fun broadcastSourceStatus(name: String?, status: SourceStatusListener.Status) {
-        broadcaster.send(SOURCE_STATUS_CHANGED) {
-            putExtra(SOURCE_STATUS_CHANGED, status.ordinal)
-            putExtra(SOURCE_SERVICE_CLASS, this@SourceService.javaClass.name)
-            name?.let { putExtra(SOURCE_STATUS_NAME, it) }
-        }
+    private fun broadcastSourceStatus(status: SourceStatusListener.Status) {
+        this.status.value = status
     }
 
     override fun sourceStatusUpdated(manager: SourceManager<*>, status: SourceStatusListener.Status) {
         if (status == SourceStatusListener.Status.DISCONNECTING) {
-            handler.execute(true) {
+            sourceServiceExecutor.execute {
                 if (this.sourceManager === manager) {
                     this.sourceManager = null
                 }
                 stopSourceManager(manager)
+                registeredSource = null
             }
         }
-        broadcastSourceStatus(manager.name, status)
+        broadcastSourceStatus(status)
     }
 
     @Synchronized
     private fun unsetSourceManager(): SourceManager<*>? {
-        return sourceManager.also {
-            sourceManager = null
-        }
+        val oldSourceManager = sourceManager
+        sourceManager = null
+        return oldSourceManager
     }
 
     private fun stopSourceManager(manager: SourceManager<*>?) {
@@ -235,10 +325,16 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
      */
     protected abstract fun createSourceManager(): SourceManager<T>
 
+    /**
+     * Handle attribute updates from the user.
+     * Override to respond to changes in manual attributes.
+     */
+    protected open fun onManualAttributesUpdate(value: Map<String, String>) {}
+
     fun startRecording(acceptableIds: Set<String>) {
-        if (!handler.isStarted) handler.start()
-        handler.execute {
-            if (key.getUserId() == null) {
+        if (!sourceServiceExecutor.isStarted.get()) sourceServiceExecutor.start()
+        sourceServiceExecutor.execute {
+            if (key.userId == null) {
                 logger.error("Cannot start recording with service {}: user ID is not set.", this)
                 delayedStart = acceptableIds
             } else {
@@ -249,7 +345,7 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
 
     private fun doStart(acceptableIds: Set<String>) {
         val expectedNames = expectedSourceNames
-        val actualIds = if (expectedNames.isEmpty()) acceptableIds else expectedNames
+        val actualIds = expectedNames.ifEmpty { acceptableIds }
 
         when {
             sourceManager?.state?.status == SourceStatusListener.Status.DISCONNECTED -> {
@@ -282,30 +378,24 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
         }
     }
 
-    private fun startAfterDelay(acceptableIds: Set<String>) {
-        handler.executeReentrant {
-            if (startFuture == null) {
-                logger.warn("Starting recording soon for {}", name)
-                startFuture = handler.delay(100) {
-                    startFuture?.let {
-                        startFuture = null
-                        doStart(acceptableIds)
-                    }
+    private fun startAfterDelay(acceptableIds: Set<String>) = sourceServiceExecutor.executeReentrant {
+        if (startFuture == null) {
+            logger.warn("Starting recording soon for {}", name)
+            startFuture = sourceServiceExecutor.delay(100) {
+                startFuture?.let {
+                    startFuture = null
+                    doStart(acceptableIds)
                 }
             }
         }
     }
 
-    fun restartRecording(acceptableIds: Set<String>) {
-        handler.execute {
-            doStop()
-            doStart(acceptableIds)
-        }
+    fun restartRecording(acceptableIds: Set<String>) = sourceServiceExecutor.execute {
+        doStop()
+        doStart(acceptableIds)
     }
 
-    fun stopRecording() {
-        handler.stop { doStop() }
-    }
+    fun stopRecording() = sourceServiceExecutor.stop { doStop() }
 
     private fun doStop() {
         delayedStart = null
@@ -322,10 +412,12 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
     }
 
     override fun loginSucceeded(manager: LoginManager?, authState: AppAuthState) {
-        if (!handler.isStarted) handler.start()
-        handler.execute {
-            key.setProjectId(authState.projectId)
-            key.setUserId(authState.userId)
+        if (!sourceServiceExecutor.isStarted.get()) {
+            sourceServiceExecutor.start()
+        }
+        sourceServiceExecutor.execute {
+            key.projectId = authState.projectId
+            key.userId = authState.userId
             needsRegisteredSources = authState.needsRegisteredSources
             sourceTypes = authState.sourceTypes.toHashSet()
             sources = authState.sourceMetadata
@@ -340,6 +432,8 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
 
     }
 
+    override fun logoutSucceeded(manager: LoginManager?, authState: AppAuthState) = Unit
+
     /**
      * Override this function to get any parameters from the given intent.
      * Bundle classloader needs to be set correctly for this to work.
@@ -352,8 +446,10 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
         pluginName = requireNotNull(bundle.getString(PLUGIN_NAME_KEY)) { "Missing source producer" }
         sourceProducer = requireNotNull(bundle.getString(PRODUCER_KEY)) { "Missing source producer" }
         sourceModel = requireNotNull(bundle.getString(MODEL_KEY)) { "Missing source model" }
-        if (!authConnection.isBound) {
-            authConnection.bind()
+        lifecycleScope.launch {
+            if (authConnection.state.value !is ManagedServiceConnection.BoundService) {
+                authConnection.bind()
+            }
         }
     }
 
@@ -366,23 +462,21 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
         val source = SourceMetadata(type).apply {
             sourceId = existingSource.sourceId
             sourceName = existingSource.sourceName
-            this.attributes = attributes
+            this.attributes = attributes + manualAttributes
         }
 
         val onFail: (Exception?) -> Unit = {
             logger.warn("Failed to register source: {}", it.toString())
             if (registrationFuture == null) {
-                registrationFuture = handler.delay(300_000L) {
-                    if (registrationFuture == null) {
-                        return@delay
-                    }
+                registrationFuture = sourceServiceExecutor.delay(300_000L) {
+                    registrationFuture ?: return@delay
                     registrationFuture = null
                     registerSource(existingSource, type, attributes)
                 }
             }
         }
 
-        authConnection.binder?.updateSource(
+        authConnectionBinder?.updateSource(
             source,
             { authState, updatedSource ->
                 key.projectId = authState.projectId
@@ -391,13 +485,14 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
                 source.sourceId = updatedSource.sourceId
                 source.sourceName = updatedSource.sourceName
                 source.expectedSourceName = updatedSource.expectedSourceName
+                registeredSource = source
             },
             onFail,
         ) ?: onFail(null)
     }
 
     open fun ensureRegistration(id: String?, name: String?, attributes: Map<String, String>, onMapping: (SourceMetadata?) -> Unit) {
-        handler.executeReentrant {
+        sourceServiceExecutor.executeReentrant {
             if (!needsRegisteredSources) {
                 onMapping(SourceMetadata(SourceType(0, sourceProducer, sourceModel, "UNKNOWN", true)).apply {
                     sourceId = id
@@ -408,37 +503,14 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
             }
             if (!isAuthorizedForSource) {
                 logger.warn("Cannot register source {} yet: allowed source types are empty", id)
-                registrationFuture = handler.delay(100L) {
-                    if (registrationFuture == null) {
-                        return@delay
-                    }
+                registrationFuture = sourceServiceExecutor.delay(100L) {
+                    registrationFuture ?: return@delay
                     registrationFuture = null
                     ensureRegistration(id, name, attributes, onMapping)
-
                 }
             }
 
-            val matchingSource = acceptableSources
-                    .find { source ->
-                        val physicalId = source.attributes["physicalId"]?.takeIf { it.isNotEmpty() }
-                        val pluginMatches = pluginName in source.attributes
-                        val physicalName = source.attributes["physicalName"]?.takeIf { it.isNotEmpty() }
-                        when {
-                            pluginMatches -> true
-                            source.matches(id, name) -> true
-                            id != null && physicalId != null && id in physicalId -> true
-                            id != null && physicalId != null -> {
-                                logger.warn("Physical id {} does not match registered id {}", physicalId, id)
-                                false
-                            }
-                            physicalName != null && name != null && name in physicalName -> true
-                            physicalName != null -> {
-                                logger.warn("Physical name {} does not match registered name {}", physicalName, name)
-                                false
-                            }
-                            else -> false
-                        }
-                    }
+            val matchingSource = findMatchingSource(id, name)
 
             if (matchingSource == null) {
                 logger.warn("Cannot find matching source type for producer {} and model {}", sourceProducer, sourceModel)
@@ -460,6 +532,28 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
         }
     }
 
+    open fun findMatchingSource(id: String?, name: String?): SourceMetadata? = acceptableSources
+        .find { source ->
+            val physicalId = source.attributes["physicalId"]?.takeIf { it.isNotEmpty() }
+            val pluginMatches = pluginName in source.attributes
+            val physicalName = source.attributes["physicalName"]?.takeIf { it.isNotEmpty() }
+            when {
+                pluginMatches -> true
+                source.matches(id, name) -> true
+                id != null && physicalId != null && id in physicalId -> true
+                id != null && physicalId != null -> {
+                    logger.warn("Physical id {} does not match registered id {}", physicalId, id)
+                    false
+                }
+                physicalName != null && name != null && name in physicalName -> true
+                physicalName != null -> {
+                    logger.warn("Physical name {} does not match registered name {}", physicalName, name)
+                    false
+                }
+                else -> false
+            }
+        }
+
     override fun toString() = "$name<${sourceManager?.name}>"
 
     companion object {
@@ -469,11 +563,14 @@ abstract class SourceService<T : BaseSourceState> : LifecycleService(), SourceSt
         const val SERVER_RECORDS_SENT_NUMBER = PREFIX + "ServerStatusListener.lastNumberOfRecordsSent"
         const val CACHE_TOPIC = PREFIX + "DataCache.topic"
         const val CACHE_RECORDS_UNSENT_NUMBER = PREFIX + "DataCache.numberOfRecords.first"
-        const val SOURCE_SERVICE_CLASS = PREFIX + "SourceService.getClass"
-        const val SOURCE_STATUS_CHANGED = PREFIX + "SourceStatusListener.Status"
         const val SOURCE_STATUS_NAME = PREFIX + "SourceManager.getName"
         const val SOURCE_CONNECT_FAILED = PREFIX + "SourceStatusListener.sourceFailedToConnect"
 
         private val logger = LoggerFactory.getLogger(SourceService::class.java)
     }
+
+    data class SourceConnectFailed(
+        val serviceClass: Class<in SourceService<*>>,
+        val sourceName: String,
+    )
 }

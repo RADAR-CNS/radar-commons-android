@@ -25,11 +25,12 @@ import org.radarbase.android.R
 import org.radarbase.android.RadarService
 import org.radarbase.android.RadarService.Companion.ACCESS_BACKGROUND_LOCATION_COMPAT
 import org.slf4j.LoggerFactory
+import kotlin.time.Duration
 
 
 open class PermissionHandler(
     private val activity: AppCompatActivity,
-    private val mHandler: SafeHandler,
+    private val mHandler: CoroutineTaskExecutor,
     private val requestPermissionTimeoutMs: Long,
 ) {
     private val broadcaster = LocalBroadcastManager.getInstance(activity)
@@ -37,7 +38,7 @@ open class PermissionHandler(
     private val needsPermissions: MutableSet<String> = HashSet()
     private val isRequestingPermissions: MutableSet<String> = HashSet()
     private var isRequestingPermissionsTime = java.lang.Long.MAX_VALUE
-    private var requestFuture: SafeHandler.HandlerFuture? = null
+    private var requestFuture: CoroutineTaskExecutor.CoroutineFutureHandle? = null
 
     private fun onPermissionRequestResult(permission: String, granted: Boolean) {
         mHandler.execute {

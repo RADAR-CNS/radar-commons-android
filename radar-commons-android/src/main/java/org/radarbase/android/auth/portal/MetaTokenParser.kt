@@ -14,18 +14,19 @@ import java.io.IOException
  * Reads refreshToken and meta-data of token from json string and sets it as property in
  * [AppAuthState].
  */
-class MetaTokenParser(private val currentState: AppAuthState) : AuthStringParser {
+class MetaTokenParser(private val currentState: AppAuthState.Builder) : AuthStringParser {
 
     @Throws(IOException::class)
-    override fun parse(value: String): AppAuthState {
+    override suspend fun parse(value: JSONObject): AppAuthState.Builder {
         try {
-            val json = JSONObject(value)
-            return currentState.alter {
-                attributes[MP_REFRESH_TOKEN_PROPERTY] = json.getString("refreshToken")
-                attributes[PRIVACY_POLICY_URL_PROPERTY] = json.getString("privacyPolicyUrl")
-                attributes[BASE_URL_PROPERTY] = json.getString("baseUrl")
-                needsRegisteredSources = true
-                authenticationSource = SOURCE_TYPE
+            return currentState.apply {
+                attributes.apply {
+                    put(MP_REFRESH_TOKEN_PROPERTY, value.getString("refreshToken"))
+                    put(PRIVACY_POLICY_URL_PROPERTY, value.getString("privacyPolicyUrl"))
+                    put(BASE_URL_PROPERTY, value.getString("baseUrl"))
+                    needsRegisteredSources = true
+                    authenticationSource = SOURCE_TYPE
+                }
             }
         } catch (ex: JSONException) {
             throw IOException("Failed to parse json string $value", ex)

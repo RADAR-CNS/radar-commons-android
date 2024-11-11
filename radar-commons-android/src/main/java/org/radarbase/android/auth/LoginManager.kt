@@ -27,14 +27,17 @@ interface LoginManager {
      * Types of authentication sources that the current login manager can handle.
      * @return non-empty list of source types.
      */
-    val sourceTypes: List<String>
+    val sourceTypes: Set<String>
+
+    fun appliesTo(authState: AppAuthState): Boolean =
+        authState.authenticationSource == null || authState.authenticationSource in sourceTypes
 
     /**
-     * With or without user interaction, refresh the current authentication state. The result will
-     * be passed to a LoginListener.
-     * @return whether the current login manager will attempt to refresh the authentication state.
+     * With or without user interaction, refresh the current authentication state.
+     * The result will be passed to a LoginListener.
+     * Returns false if no refresh information is available.
      */
-    fun refresh(authState: AppAuthState): Boolean
+    suspend fun refresh(authState: AppAuthState.Builder): Boolean
 
     /**
      * Without user interaction, assess whether the current authentication state was valid under the
@@ -52,7 +55,7 @@ interface LoginManager {
      *
      * @param authState current authentication state
      */
-    fun start(authState: AppAuthState)
+    suspend fun start(authState: AppAuthState)
 
     /**
      * Initialization at the end of [LoginActivity.onCreate].
@@ -68,25 +71,42 @@ interface LoginManager {
      * @return invalidated state, or `null` if the current loginManager cannot invalidate
      * the token.
      */
-    fun invalidate(authState: AppAuthState, disableRefresh: Boolean): AppAuthState?
+    suspend fun invalidate(authState: AppAuthState.Builder, disableRefresh: Boolean)
 
     /**
      * Register a source.
      * @param authState authentication state
-     * @param source source metadata to resgister
+     * @param source source metadata to register
      * @param success callback to call on success
      * @param failure callback to call on failure
      * @return true if the current LoginManager can handle the registration, false otherwise.
      * @throws AuthenticationException if the manager cannot log in
      */
     @Throws(AuthenticationException::class)
-    fun registerSource(authState: AppAuthState, source: SourceMetadata,
-                       success: (AppAuthState, SourceMetadata) -> Unit,
-                       failure: (Exception?) -> Unit): Boolean
+    suspend fun registerSource(
+        authState: AppAuthState.Builder,
+        source: SourceMetadata,
+        success: suspend (AppAuthState, SourceMetadata) -> Unit,
+        failure: suspend (Exception?) -> Unit
+    ): Boolean
 
     fun onDestroy()
 
-    fun updateSource(appAuth: AppAuthState, source: SourceMetadata, success: (AppAuthState, SourceMetadata) -> Unit, failure: (Exception?) -> Unit): Boolean
+    /**
+     * Update a source.
+     * @param appAuth authentication state
+     * @param source source metadata to register
+     * @param success callback to call on success
+     * @param failure callback to call on failure
+     * @return true if the current LoginManager can handle the update, false otherwise.
+     * @throws AuthenticationException if the manager cannot log in
+     */
+    suspend fun updateSource(
+        appAuth: AppAuthState.Builder,
+        source: SourceMetadata,
+        success: (AppAuthState, SourceMetadata) -> Unit,
+        failure: (Exception?) -> Unit
+    ): Boolean
 
     companion object {
         /** HTTP basic authentication.  */

@@ -16,6 +16,12 @@
 
 package org.radarbase.passive.phone
 
+import android.content.Context
+import android.content.SharedPreferences
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.radarbase.android.config.SingleRadarConfiguration
 import org.radarbase.android.source.BaseSourceState
 import org.radarbase.android.source.SourceManager
@@ -27,6 +33,23 @@ class PhoneLocationService : SourceService<BaseSourceState>() {
         get() = BaseSourceState()
 
     override val isBluetoothConnectionRequired: Boolean = false
+
+    private val prefLock = Mutex()
+    private val preferences: SharedPreferences
+        get() = getSharedPreferences("org.radarbase.passive.phone.PhoneLocationService", Context.MODE_PRIVATE)
+
+    suspend fun withPreferences(block: SharedPreferences.() -> Unit) = prefLock.withLock {
+        preferences.block()
+    }
+    suspend fun withMutablePreferences(block: SharedPreferences.(SharedPreferences.Editor) -> Boolean) = prefLock.withLock {
+        val prefs = preferences
+        val editor = prefs.edit()
+        if (prefs.block(editor)) {
+            withContext(Dispatchers.IO) {
+                editor.commit()
+            }
+        }
+    }
 
     override fun createSourceManager() = PhoneLocationManager(this)
 

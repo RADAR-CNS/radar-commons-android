@@ -1,9 +1,9 @@
 package org.radarbase.passive.polar
 
+import PolarUtils
 import android.annotation.SuppressLint
 import android.content.Context.POWER_SERVICE
 import android.os.PowerManager
-import android.os.Process.THREAD_PRIORITY_BACKGROUND
 import android.util.Log
 import com.polar.sdk.api.PolarBleApi
 import com.polar.sdk.api.PolarBleApiCallback
@@ -11,12 +11,12 @@ import com.polar.sdk.api.PolarBleApiDefaultImpl.defaultImplementation
 import com.polar.sdk.api.errors.PolarInvalidArgument
 import com.polar.sdk.api.model.*
 import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers
-import io.reactivex.rxjava3.disposables.Disposable
 import io.reactivex.rxjava3.core.Flowable
+import io.reactivex.rxjava3.disposables.Disposable
 import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.SourceStatusListener
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarcns.kafka.ObservationKey
 import org.radarcns.passive.polar.*
 import org.slf4j.LoggerFactory
@@ -40,7 +40,7 @@ class PolarManager(
     private val ppgTopic: DataCache<ObservationKey, PolarPpg> =
         createCache("android_polar_ppg", PolarPpg())
 
-    private val mHandler = SafeHandler.getInstance("Polar sensors", THREAD_PRIORITY_BACKGROUND)
+    private val polarExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
     private var wakeLock: PowerManager.WakeLock? = null
 
     private lateinit var api: PolarBleApi
@@ -68,8 +68,8 @@ class PolarManager(
         connectToPolarSDK()
 
         register()
-        mHandler.start()
-        mHandler.execute {
+        polarExecutor.start()
+        polarExecutor.execute {
             wakeLock = (service.getSystemService(POWER_SERVICE) as PowerManager?)?.let { pm ->
                 pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "org.radarcns.polar:PolarManager")
                     .also { it.acquire() }
@@ -163,7 +163,7 @@ class PolarManager(
                 val batteryLevel = level.toFloat() / 100.0f
                 state.batteryLevel = batteryLevel
                 logger.debug("Battery level $level%, which is $batteryLevel at $currentTime")
-                mHandler.execute {
+                polarExecutor.execute {
                     send(
                         batteryLevelTopic,
                         PolarBatteryLevel(name, currentTime, currentTime, batteryLevel)
@@ -210,7 +210,7 @@ class PolarManager(
         }
 
         disconnectToPolarSDK(deviceId)
-        mHandler.stop {
+        polarExecutor.stop {
             wakeLock?.release()
         }
 
@@ -302,7 +302,7 @@ class PolarManager(
                                             "contactStatus: ${sample.contactStatus} " +
                                             "contactStatusSupported: ${sample.contactStatusSupported}"
                                 )
-                                mHandler.execute {
+                                polarExecutor.execute {
                                     send(
                                         heartRateTopic,
                                         PolarHeartRate(
@@ -353,7 +353,7 @@ class PolarManager(
                                         PolarUtils.convertEpochPolarToUnixEpoch(data.timeStamp)
                                     } currentTime: $currentTime PolarTimeStamp: ${data.timeStamp}"
                                 )
-                                mHandler.execute {
+                                polarExecutor.execute {
                                     send(
                                         ecgTopic,
                                         PolarEcg(
@@ -396,7 +396,7 @@ class PolarManager(
                                         PolarUtils.convertEpochPolarToUnixEpoch(data.timeStamp)
                                     } currentTime: $currentTime PolarTimeStamp: ${data.timeStamp}"
                                 )
-                                mHandler.execute {
+                                polarExecutor.execute {
                                     send(
                                         accelerationTopic,
                                         PolarAcceleration(
@@ -445,7 +445,7 @@ class PolarManager(
                                             PolarUtils.convertEpochPolarToUnixEpoch(data.timeStamp)
                                         } currentTime: $currentTime PolarTimeStamp: ${data.timeStamp}"
                                     )
-                                    mHandler.execute {
+                                    polarExecutor.execute {
                                         send(
                                             ppgTopic,
                                             PolarPpg(
@@ -486,7 +486,7 @@ class PolarManager(
                                             "errorEstimate: ${sample.errorEstimate} " +
                                             "currentTime: $currentTime"
                                 )
-                                mHandler.execute {
+                                polarExecutor.execute {
                                     send(
                                         ppIntervalTopic,
                                         PolarPpInterval(

@@ -16,16 +16,16 @@
 
 package org.radarbase.passive.weather
 
+import io.ktor.client.HttpClient
 import net.aksingh.owmjapis.CurrentWeather
 import net.aksingh.owmjapis.OpenWeatherMap
-import okhttp3.OkHttpClient
 import org.json.JSONException
 import org.radarcns.passive.weather.WeatherCondition
 import java.io.IOException
 import java.math.BigDecimal
 import java.util.*
 
-internal class OpenWeatherMapApi(apiKey: String, client: OkHttpClient) : WeatherApi {
+internal class OpenWeatherMapApi(apiKey: String, client: HttpClient) : WeatherApi {
     private val owm: OpenWeatherMap = OpenWeatherMap(OpenWeatherMap.UNITS_METRIC,
             OpenWeatherMap.LANGUAGE_ENGLISH, apiKey, client)
 

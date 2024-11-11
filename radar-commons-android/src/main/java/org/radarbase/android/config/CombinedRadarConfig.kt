@@ -4,63 +4,112 @@ import android.content.Context
 import androidx.lifecycle.MutableLiveData
 import com.google.firebase.analytics.FirebaseAnalytics
 import com.google.firebase.crashlytics.FirebaseCrashlytics
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.launch
 import org.radarbase.android.RadarConfiguration
 import org.radarbase.android.RadarConfiguration.Companion.BASE_URL_KEY
 import org.radarbase.android.RadarConfiguration.Companion.FETCH_TIMEOUT_MS_DEFAULT
 import org.radarbase.android.RadarConfiguration.Companion.FETCH_TIMEOUT_MS_KEY
 import org.radarbase.android.RadarConfiguration.Companion.PROJECT_ID_KEY
 import org.radarbase.android.RadarConfiguration.Companion.USER_ID_KEY
-import org.radarbase.android.RadarConfiguration.RemoteConfigStatus.*
+import org.radarbase.android.RadarConfiguration.RemoteConfigStatus.ERROR
+import org.radarbase.android.RadarConfiguration.RemoteConfigStatus.FETCHED
+import org.radarbase.android.RadarConfiguration.RemoteConfigStatus.FETCHING
+import org.radarbase.android.RadarConfiguration.RemoteConfigStatus.INITIAL
+import org.radarbase.android.RadarConfiguration.RemoteConfigStatus.PARTIALLY_FETCHED
+import org.radarbase.android.RadarConfiguration.RemoteConfigStatus.READY
+import org.radarbase.android.RadarConfiguration.RemoteConfigStatus.UNAVAILABLE
 import org.radarbase.android.auth.AppAuthState
 import org.radarbase.android.auth.portal.GetSubjectParser.Companion.externalUserId
 import org.radarbase.android.auth.portal.GetSubjectParser.Companion.humanReadableUserId
+import org.radarbase.kotlin.coroutines.flow.zipAll
+import org.radarbase.kotlin.coroutines.launchJoin
 import org.slf4j.LoggerFactory
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 
 class CombinedRadarConfig(
     private val localConfig: LocalConfig,
     private val remoteConfigs: List<RemoteConfig>,
-    defaultsFactory: () -> Map<String, String>,
+    defaults: Map<String, String>,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext + Dispatchers.Default,
 ): RadarConfiguration {
-    private val defaults = defaultsFactory()
-            .filterValues { it.isNotEmpty() }
-    @Volatile
-    override var status: RadarConfiguration.RemoteConfigStatus = INITIAL
+    private val defaults = defaults.filterValues { it.isNotEmpty() }
 
-    @Volatile
-    override var latestConfig: SingleRadarConfiguration = readConfig()
-    override val config: MutableLiveData<SingleRadarConfiguration> = MutableLiveData()
+    override val status: MutableStateFlow<RadarConfiguration.RemoteConfigStatus> = MutableStateFlow(INITIAL)
+    override var latestConfig: SingleRadarConfiguration
+        get() = config.value
+        set(value) {
+            config.value = value
+        }
+
+    override val config: MutableStateFlow<SingleRadarConfiguration> = MutableStateFlow(
+        SingleRadarConfiguration(INITIAL, mapOf())
+    )
+
+    private val job = SupervisorJob()
+    private val configScope = CoroutineScope(coroutineContext + job + CoroutineName("CombinedConfig"))
 
     init {
-        config.postValue(latestConfig)
-
-        remoteConfigs.forEach { remoteConfig ->
-            remoteConfig.onStatusUpdateListener = { newStatus ->
-                logger.info("Got updated status {}", newStatus)
-
-                updateStatus()
-
-                if (newStatus == FETCHED) {
-                    updateConfig()
-                }
+        configScope.launch {
+            launch {
+                updateConfig()
+            }
+            launch {
+                collectStatus()
+            }
+            launch {
+                collectConfig()
+            }
+            launch {
+                propagateConfig()
             }
         }
     }
 
-    private fun updateStatus() {
-        val allStatus = remoteConfigs.map { it.status }
-        status = when {
-            FETCHING in allStatus -> FETCHING
-            FETCHED in allStatus && allStatus.all { it == FETCHED || it == UNAVAILABLE } -> FETCHED
-            FETCHED in allStatus || PARTIALLY_FETCHED in allStatus -> PARTIALLY_FETCHED
-            ERROR in allStatus -> ERROR
-            READY in allStatus -> READY
-            INITIAL in allStatus -> INITIAL
-            else -> UNAVAILABLE
-        }
+    private suspend fun collectStatus() {
+        remoteConfigs.map { it.status }
+            .zipAll()
+            .collect { allStatus ->
+                status.value = when {
+                    FETCHING in allStatus -> FETCHING
+                    FETCHED in allStatus && allStatus.all { it == FETCHED || it == UNAVAILABLE } -> FETCHED
+                    FETCHED in allStatus || PARTIALLY_FETCHED in allStatus -> PARTIALLY_FETCHED
+                    ERROR in allStatus -> ERROR
+                    READY in allStatus -> READY
+                    INITIAL in allStatus -> INITIAL
+                    else -> UNAVAILABLE
+                }
+            }
     }
 
-    private fun updateConfig() {
-        val newConfig = readConfig()
+    private suspend fun collectConfig() {
+        status
+            .filter { it == FETCHED }
+            .collect { updateConfig(it) }
+    }
+
+    private suspend fun propagateConfig() {
+        config
+            .drop(1)
+            .collect { newConfig ->
+                remoteConfigs.launchJoin {
+                    it.updateWithConfig(newConfig)
+                }
+            }
+    }
+
+    private fun updateConfig(
+        status: RadarConfiguration.RemoteConfigStatus = this.status.value,
+    ) {
+        val newConfig = readConfig(status)
         if (newConfig != latestConfig) {
             if (newConfig.status != latestConfig.status) {
                 logger.info("Updating config status to {}", newConfig.status)
@@ -69,8 +118,6 @@ class CombinedRadarConfig(
                 logger.info("Updating config to {}", newConfig)
             }
             latestConfig = newConfig
-            config.postValue(newConfig)
-            remoteConfigs.forEach { it.updateWithConfig(newConfig) }
         } else {
             logger.info("No change to config. Skipping.")
         }
@@ -78,13 +125,13 @@ class CombinedRadarConfig(
 
     override fun put(key: String, value: Any): String? = localConfig.put(key, value)
 
-    override fun persistChanges() {
+    override suspend fun persistChanges() {
         if (localConfig.persistChanges()) {
             updateConfig()
         }
     }
 
-    private fun readConfig() = SingleRadarConfiguration(status, HashMap<String, String>().apply {
+    private fun readConfig(status: RadarConfiguration.RemoteConfigStatus) = SingleRadarConfiguration(status, HashMap<String, String>().apply {
         this += defaults
         remoteConfigs.forEach {
             this += it.cache
@@ -92,22 +139,22 @@ class CombinedRadarConfig(
         this += localConfig.config
     })
 
-    override fun reset(vararg keys: String) {
+    override suspend fun reset(vararg keys: String) {
         localConfig -= keys
         persistChanges()
     }
 
-    override fun fetch() = remoteConfigs.forEach {
+    override suspend fun fetch() = remoteConfigs.launchJoin {
         it.fetch(latestConfig.getLong(FETCH_TIMEOUT_MS_KEY, FETCH_TIMEOUT_MS_DEFAULT))
     }
 
-    override fun forceFetch() = remoteConfigs.forEach {
+    override suspend fun forceFetch() = remoteConfigs.forEach {
         it.forceFetch()
     }
 
     override fun toString(): String = latestConfig.toString()
 
-    override fun updateWithAuthState(context: Context, appAuthState: AppAuthState?) {
+    override suspend fun updateWithAuthState(context: Context, appAuthState: AppAuthState?) {
         val enableAnalytics = appAuthState?.isPrivacyPolicyAccepted == true
         logger.debug("Setting Firebase Analytics enabled: {}", enableAnalytics)
         FirebaseAnalytics.getInstance(context).setAnalyticsCollectionEnabled(enableAnalytics)
@@ -146,6 +193,13 @@ class CombinedRadarConfig(
             it.updateWithAuthState(appAuthState)
         }
         forceFetch()
+    }
+
+    suspend fun stop() {
+        job.cancelAndJoin()
+        remoteConfigs.launchJoin {
+            it.stop()
+        }
     }
 
     companion object {

@@ -29,6 +29,7 @@ import com.empatica.empalink.delegate.EmpaStatusDelegate
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.SourceStatusListener
 import org.radarbase.android.util.BluetoothStateReceiver.Companion.bluetoothIsEnabled
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.NotificationHandler
 import org.radarbase.android.util.SafeHandler
 import org.radarcns.passive.empatica.*
@@ -62,6 +63,8 @@ class E4Manager(
     private var hasBeenConnecting = false
     private var apiKey: String? = null
     private var connectingFuture: SafeHandler.HandlerFuture? = null
+
+    private val dataSenderExecutor: CoroutineTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
 
     init {
         status = SourceStatusListener.Status.UNAVAILABLE
@@ -162,7 +165,8 @@ class E4Manager(
                             Pair("macAddress", address),
                             Pair("serialNumber", empaDevice.serialNumber))) {
                 if (it == null) {
-                    logger.info("Device {} with ID {} is not listed in acceptable device IDs", deviceName, address)
+                    logger.info("Device {} with ID {} is not listed in acceptable device IDs",
+                        deviceName, address)
                     service.sourceFailedToConnect(deviceName)
                 } else {
                     handler.execute {
@@ -248,51 +252,79 @@ class E4Manager(
 
     override fun didUpdateOnWristStatus(status: Int) {
         val now = currentTime
-        send(sensorStatusTopic, EmpaticaE4SensorStatus(
-                now, now, "e4", status.toEmpaStatusString()))
+        dataSenderExecutor.execute {
+            send(
+                sensorStatusTopic, EmpaticaE4SensorStatus(
+                    now, now, "e4", status.toEmpaStatusString()
+                )
+            )
+        }
     }
 
     override fun didReceiveAcceleration(x: Int, y: Int, z: Int, timestamp: Double) {
         state.setAcceleration(x / 64f, y / 64f, z / 64f)
         val latestAcceleration = state.acceleration
-        send(accelerationTopic, EmpaticaE4Acceleration(
-                timestamp, currentTime,
-                latestAcceleration[0], latestAcceleration[1], latestAcceleration[2]))
+        dataSenderExecutor.execute {
+            send(
+                accelerationTopic, EmpaticaE4Acceleration(
+                    timestamp, currentTime,
+                    latestAcceleration[0], latestAcceleration[1], latestAcceleration[2]
+                )
+            )
+        }
     }
 
     override fun didReceiveBVP(bvp: Float, timestamp: Double) {
         state.bloodVolumePulse = bvp
-        send(bloodVolumePulseTopic, EmpaticaE4BloodVolumePulse(
-                timestamp, currentTime, bvp))
+        dataSenderExecutor.execute {
+            send(
+                bloodVolumePulseTopic, EmpaticaE4BloodVolumePulse(
+                    timestamp, currentTime, bvp
+                )
+            )
+        }
     }
 
     override fun didReceiveBatteryLevel(battery: Float, timestamp: Double) {
         state.batteryLevel = battery
-        send(batteryLevelTopic, EmpaticaE4BatteryLevel(
-                timestamp, currentTime, battery))
-    }
+        dataSenderExecutor.execute {
+            send(
+                batteryLevelTopic, EmpaticaE4BatteryLevel(
+                    timestamp, currentTime, battery
+                )
+            )
+        }
+        }
 
     override fun didReceiveTag(timestamp: Double) {
         val value =  EmpaticaE4Tag(timestamp, currentTime)
-        send(tagTopic, value)
+        dataSenderExecutor.execute {
+            send(tagTopic, value)
+        }
     }
 
     override fun didReceiveGSR(gsr: Float, timestamp: Double) {
         state.electroDermalActivity = gsr
         val value = EmpaticaE4ElectroDermalActivity(timestamp, currentTime, gsr)
-        send(edaTopic, value)
+        dataSenderExecutor.execute {
+            send(edaTopic, value)
+        }
     }
 
     override fun didReceiveIBI(ibi: Float, timestamp: Double) {
         state.interBeatInterval = ibi
         val value = EmpaticaE4InterBeatInterval(timestamp, currentTime, ibi)
-        send(interBeatIntervalTopic, value)
+        dataSenderExecutor.execute {
+            send(interBeatIntervalTopic, value)
+        }
     }
 
     override fun didReceiveTemperature(temperature: Float, timestamp: Double) {
         state.temperature = temperature
         val value = EmpaticaE4Temperature(timestamp, currentTime, temperature)
-        send(temperatureTopic, value)
+        dataSenderExecutor.execute {
+            send(temperatureTopic, value)
+        }
     }
 
     override fun didUpdateSensorStatus(status: Int, type: EmpaSensorType) {
@@ -300,7 +332,9 @@ class E4Manager(
         state.setSensorStatus(type, statusString)
         val now = currentTime
         val value = EmpaticaE4SensorStatus(now, now, type.name, statusString)
-        send(sensorStatusTopic, value)
+        dataSenderExecutor.execute {
+            send(sensorStatusTopic, value)
+        }
     }
 
     override fun hashCode() = System.identityHashCode(this)

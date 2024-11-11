@@ -16,10 +16,10 @@
 
 package org.radarbase.passive.bittium
 
-import org.radarbase.android.RadarApplication.Companion.radarApp
 import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.SourceStatusListener
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.NotificationHandler
 import org.radarbase.android.util.SafeHandler
 import org.radarbase.util.Strings
@@ -49,6 +49,8 @@ class FarosManager internal constructor(
     private lateinit var apiManager: FarosSdkManager
     private var settings: FarosSettings = farosFactory.defaultSettingsBuilder().build()
 
+    private val farosTaskExecutor: CoroutineTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
+
     private var faros: FarosDevice? = null
 
     override fun start(acceptableIds: Set<String>) {
@@ -56,7 +58,8 @@ class FarosManager internal constructor(
         service.getString(R.string.farosLabel)
 
         handler.start()
-        handler.execute {
+        farosTaskExecutor.start()
+        farosTaskExecutor.execute {
             this.acceptableIds = Strings.containsPatterns(acceptableIds)
 
             apiManager = farosFactory.createSdkManager(service)
@@ -73,7 +76,7 @@ class FarosManager internal constructor(
     override fun onStatusUpdate(status: Int) {
         val radarStatus = when(status) {
             FarosDeviceListener.IDLE -> {
-                handler.execute {
+                farosTaskExecutor.execute {
                     logger.debug("Faros status is IDLE. Request to start/restart measurements.")
                     applySettings(this.settings)
                     faros?.run {
@@ -118,7 +121,7 @@ class FarosManager internal constructor(
             if ((acceptableIds.isEmpty() || Strings.findAny(acceptableIds, device.name))) {
                 register(device.name, device.name, attributes) {
                     if (it != null) {
-                        handler.executeReentrant {
+                        farosTaskExecutor.executeReentrant {
                             logger.info("Stopping scanning")
                             apiManager.stopScanning()
                             name = service.getString(R.string.farosDeviceName, device.name)
@@ -137,17 +140,23 @@ class FarosManager internal constructor(
 
     override fun didReceiveAcceleration(timestamp: Double, x: Float, y: Float, z: Float) {
         state.setAcceleration(x, y, z)
-        send(accelerationTopic, BittiumFarosAcceleration(timestamp, currentTime, x, y, z))
+        farosTaskExecutor.execute {
+            send(accelerationTopic, BittiumFarosAcceleration(timestamp, currentTime, x, y, z))
+        }
     }
 
     override fun didReceiveTemperature(timestamp: Double, temperature: Float) {
         state.temperature = temperature
-        send(temperatureTopic, BittiumFarosTemperature(timestamp, currentTime, temperature))
+        farosTaskExecutor.execute {
+            send(temperatureTopic, BittiumFarosTemperature(timestamp, currentTime, temperature))
+        }
     }
 
     override fun didReceiveInterBeatInterval(timestamp: Double, interBeatInterval: Float) {
         state.heartRate = 60 / interBeatInterval
-        send(ibiTopic, BittiumFarosInterBeatInterval(timestamp, currentTime, interBeatInterval))
+        farosTaskExecutor.execute {
+            send(ibiTopic, BittiumFarosInterBeatInterval(timestamp, currentTime, interBeatInterval))
+        }
     }
 
     override fun didReceiveEcg(timestamp: Double, channels: FloatArray) {
@@ -155,32 +164,41 @@ class FarosManager internal constructor(
         val channelTwo = if (channels.size > 1) channels[1] else null
         val channelThree = if (channels.size > 2) channels[2] else null
 
-        send(ecgTopic, BittiumFarosEcg(timestamp, currentTime, channelOne, channelTwo, channelThree))
+        farosTaskExecutor.execute {
+            send(
+                ecgTopic,
+                BittiumFarosEcg(timestamp, currentTime, channelOne, channelTwo, channelThree)
+            )
+        }
     }
 
     override fun didReceiveBatteryStatus(timestamp: Double, status: Int) {
         // only send approximate battery levels if the battery level interval is disabled.
-        val level = when(status) {
+        val level = when (status) {
             FarosDeviceListener.BATTERY_STATUS_CRITICAL -> 0.05f
-            FarosDeviceListener.BATTERY_STATUS_LOW      -> 0.175f
-            FarosDeviceListener.BATTERY_STATUS_MEDIUM   -> 0.5f
-            FarosDeviceListener.BATTERY_STATUS_FULL     -> 0.875f
+            FarosDeviceListener.BATTERY_STATUS_LOW -> 0.175f
+            FarosDeviceListener.BATTERY_STATUS_MEDIUM -> 0.5f
+            FarosDeviceListener.BATTERY_STATUS_FULL -> 0.875f
             else -> {
                 logger.warn("Unknown battery status {} passed", status)
                 return
             }
         }
         state.batteryLevel = level
-        send(batteryTopic, BittiumFarosBatteryLevel(timestamp, currentTime, level, false))
+        farosTaskExecutor.execute {
+            send(batteryTopic, BittiumFarosBatteryLevel(timestamp, currentTime, level, false))
+        }
     }
 
     override fun didReceiveBatteryLevel(timestamp: Double, level: Float) {
         state.batteryLevel = level
-        send(batteryTopic, BittiumFarosBatteryLevel(timestamp, currentTime, level, true))
+        farosTaskExecutor.execute {
+            send(batteryTopic, BittiumFarosBatteryLevel(timestamp, currentTime, level, true))
+        }
     }
 
     internal fun applySettings(settings: FarosSettings) {
-        handler.executeReentrant {
+        farosTaskExecutor.executeReentrant {
             this.settings = settings
             faros?.run {
                 if (isMeasuring) {
@@ -213,7 +231,8 @@ class FarosManager internal constructor(
     override fun onClose() {
         logger.info("Faros BT Closing device {}", this)
 
-        handler.stop {
+        handler.stop()
+        farosTaskExecutor.stop {
             try {
                 faros?.close()
             } catch (e2: IOException) {

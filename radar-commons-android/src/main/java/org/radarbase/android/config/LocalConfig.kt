@@ -19,7 +19,7 @@ interface LocalConfig {
     fun put(key: String, value: Any): String?
     fun removeAll(keys: Array<out String>)
     operator fun minusAssign(keys: Array<out String>) = removeAll(keys)
-    fun persistChanges(): Boolean
+    suspend fun persistChanges(): Boolean
     val keys: Set<String>
     operator fun get(key: String): String?
     operator fun contains(key: String): Boolean

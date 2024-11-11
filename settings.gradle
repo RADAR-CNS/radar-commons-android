@@ -3,8 +3,10 @@ include ':radar-commons-android'
 include ':avro-android'
 
 file("${rootDir}/plugins").listFiles().each { pluginDir ->
-    if (!file("$pluginDir/gradle.skip").exists()) {
-        include pluginDir.name
-        project(":${pluginDir.name}").projectDir = pluginDir
-    }
+    if (!pluginDir.isDirectory()) return
+    if (pluginDir.name.startsWith(".")) return
+    if (file("$pluginDir/gradle.skip").exists()) return
+
+    include pluginDir.name
+    project(":${pluginDir.name}").projectDir = pluginDir
 }

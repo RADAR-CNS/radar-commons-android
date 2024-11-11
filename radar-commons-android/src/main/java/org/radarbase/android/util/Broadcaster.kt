@@ -32,8 +32,10 @@ fun LocalBroadcastManager.send(action: String, intent: (Intent.() -> Unit)? = nu
     sendBroadcast(broadcast)
 }
 
-data class BroadcastRegistration(private val broadcaster: LocalBroadcastManager,
-                                 private var receiver: BroadcastReceiver?) {
+data class BroadcastRegistration(
+    private val broadcaster: LocalBroadcastManager,
+    private var receiver: BroadcastReceiver?,
+) {
     fun unregister() {
         receiver?.let { broadcaster.unregisterReceiver(it) }
         receiver = null

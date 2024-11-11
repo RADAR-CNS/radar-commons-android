@@ -17,19 +17,28 @@
 package org.radarbase.android.data
 
 import android.content.Context
-import android.os.Process.THREAD_PRIORITY_BACKGROUND
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.cio.CIO
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.*
 import org.apache.avro.specific.SpecificRecord
-import org.radarbase.android.kafka.KafkaDataSubmitter
-import org.radarbase.android.kafka.ServerStatusListener
-import org.radarbase.android.source.SourceService.Companion.CACHE_RECORDS_UNSENT_NUMBER
-import org.radarbase.android.source.SourceService.Companion.CACHE_TOPIC
+import org.radarbase.android.kafka.*
 import org.radarbase.android.util.BatteryStageReceiver
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.NetworkConnectedReceiver
-import org.radarbase.android.util.SafeHandler
-import org.radarbase.android.util.send
-import org.radarbase.producer.rest.RestClient
-import org.radarbase.producer.rest.RestSender
+import org.radarbase.kotlin.coroutines.CacheConfig
+import org.radarbase.kotlin.coroutines.launchJoin
+import org.radarbase.producer.io.timeout
+import org.radarbase.producer.io.unsafeSsl
+import org.radarbase.producer.rest.RestKafkaSender
+import org.radarbase.producer.rest.RestKafkaSender.Companion.GZIP_CONTENT_ENCODING
+import org.radarbase.producer.rest.RestKafkaSender.Companion.KAFKA_REST_BINARY_ENCODING
+import org.radarbase.producer.rest.RestKafkaSender.Companion.KAFKA_REST_JSON_ENCODING
+import org.radarbase.producer.rest.RestKafkaSender.Companion.restKafkaSender
 import org.radarbase.topic.AvroTopic
 import org.radarcns.kafka.ObservationKey
 import org.slf4j.LoggerFactory
@@ -37,8 +46,8 @@ import java.io.IOException
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
-import java.util.concurrent.TimeUnit
-import kotlin.collections.HashMap
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Stores data in databases and sends it to the server. If kafkaConfig is null, data will only be
@@ -47,70 +56,78 @@ import kotlin.collections.HashMap
 class TableDataHandler(
     private val context: Context,
     private val cacheStore: CacheStore,
+    handlerDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) : DataHandler<ObservationKey, SpecificRecord> {
     private val tables: ConcurrentMap<String, DataCacheGroup<*, *>> = ConcurrentHashMap()
     private val batteryLevelReceiver: BatteryStageReceiver
-    private val networkConnectedReceiver: NetworkConnectedReceiver
-    private val handlerThread: SafeHandler = SafeHandler.getInstance("TableDataHandler", THREAD_PRIORITY_BACKGROUND)
-    private val broadcaster = LocalBroadcastManager.getInstance(context)
-
+    private val networkConnectedReceiver: NetworkConnectedReceiver =
+        NetworkConnectedReceiver(context)
     private var config = DataHandlerConfiguration()
 
-    @Volatile
-    var latestStatus: ServerStatusListener.Status = ServerStatusListener.Status.DISCONNECTED
-    override var status: ServerStatusListener.Status = ServerStatusListener.Status.DISCONNECTED
+    override var serverStatus = MutableStateFlow(ServerStatus.DISCONNECTED)
+    override val numberOfRecords =
+        MutableSharedFlow<CacheSize>(onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
     private val lastNumberOfRecordsSent = TreeMap<String, Long>()
     private var submitter: KafkaDataSubmitter? = null
-    private var sender: RestSender? = null
+    private var sender: RestKafkaSender? = null
+
+    private val handlerExecutor: CoroutineTaskExecutor =
+        CoroutineTaskExecutor(TableDataHandler::class.simpleName!!, handlerDispatcher)
+
+    private var job: Job? = null
+    private var networkStateCollectorJob: Job? = null
 
     private val isStarted: Boolean
         get() = submitter != null
 
-    override val recordsSent: Map<String, Long>
-        get() = handlerThread.compute {
-            HashMap(lastNumberOfRecordsSent)
-        }
+    override val recordsSent = MutableSharedFlow<TopicSendReceipt>(
+        replay = 1000,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
 
     init {
-        this.handlerThread.start()
-        this.handlerThread.repeat(10_000L, ::broadcastNumberOfRecords)
+        job = SupervisorJob().also(handlerExecutor::start)
 
-        this.batteryLevelReceiver = BatteryStageReceiver(context, config.batteryStageLevels) { stage ->
-            when (stage) {
-                BatteryStageReceiver.BatteryStage.FULL -> {
-                    handler {
-                        submitter {
-                            uploadRateMultiplier = 1
+        this.batteryLevelReceiver =
+            BatteryStageReceiver(context, config.batteryStageLevels) { stage ->
+                when (stage) {
+                    BatteryStageReceiver.BatteryStage.FULL -> {
+                        handler {
+                            submitter {
+                                uploadRateMultiplier = 1
+                            }
                         }
                     }
-                }
-                BatteryStageReceiver.BatteryStage.REDUCED -> {
-                    logger.info("Battery level getting low, reducing data sending")
-                    handler {
-                        submitter {
-                            uploadRateMultiplier = reducedUploadMultiplier
+
+                    BatteryStageReceiver.BatteryStage.REDUCED -> {
+                        logger.info("Battery level getting low, reducing data sending")
+                        handler {
+                            submitter {
+                                uploadRateMultiplier = reducedUploadMultiplier
+                            }
                         }
                     }
-                }
-                BatteryStageReceiver.BatteryStage.EMPTY -> {
-                    if (isStarted) {
-                        logger.info("Battery level getting very low, stopping data sending")
-                        stop()
+
+                    BatteryStageReceiver.BatteryStage.EMPTY -> {
+                        if (isStarted) {
+                            logger.info("Battery level getting very low, stopping data sending")
+                            pause()
+                        }
                     }
                 }
             }
-        }
-        this.networkConnectedReceiver = NetworkConnectedReceiver(context) { state ->
-            if (isStarted) {
-                if (!state.hasConnection(config.sendOnlyWithWifi)) {
-                    logger.info("Network was disconnected, stopping data sending")
-                    stop()
+
+        handlerExecutor.execute {
+            caches.launchJoin { cache ->
+                cache.numberOfRecords.collect {
+                    numberOfRecords.emit(
+                        CacheSize(
+                            cache.readTopic.name,
+                            cache.numberOfRecords.value
+                        )
+                    )
                 }
-            } else {
-                // Just try to start: the start method will not do anything if the parameters
-                // are not right.
-                start()
             }
         }
 
@@ -118,23 +135,35 @@ class TableDataHandler(
         sender = null
 
         if (config.restConfig.kafkaConfig != null) {
-            handlerThread.execute {
+            handlerExecutor.execute {
                 doEnableSubmitter()
             }
         } else {
             logger.info("Submitter is disabled: no kafkaConfig provided in init")
-            updateServerStatus(ServerStatusListener.Status.DISABLED)
+            serverStatus.value = ServerStatus.DISABLED
         }
     }
 
-    private fun broadcastNumberOfRecords() {
-        caches.forEach { cache ->
-            val records = cache.numberOfRecords
-            broadcaster.send(CACHE_TOPIC) {
-                putExtra(CACHE_TOPIC, cache.readTopic.name)
-                putExtra(CACHE_RECORDS_UNSENT_NUMBER, records)
+    suspend fun monitor() {
+        networkStateCollectorJob = handlerExecutor.returnJobAndExecute {
+            startMonitoring()
+            networkConnectedReceiver.state?.collectLatest { state ->
+                if (isStarted) {
+                    if (!state.hasConnection(config.sendOnlyWithWifi)) {
+                        logger.info("Network was disconnected, stopping data sending")
+                        pause()
+                    }
+                } else {
+                    // Just try to start: the start method will not do anything if the parameters
+                    // are not right.
+                    start()
+                }
             }
         }
+    }
+
+    private suspend fun startMonitoring() {
+        networkConnectedReceiver.monitor()
     }
 
     /**
@@ -143,20 +172,23 @@ class TableDataHandler(
      * This will not do anything if there is not already a submitter running, if it is disabled,
      * if the network is not connected or if the battery is running too low.
      */
-    fun start() = handlerThread.executeReentrant {
+    fun start() = handlerExecutor.executeReentrant {
         if (isStarted
             || config.submitterConfig.userId == null
-            || status === ServerStatusListener.Status.DISABLED
-            || !networkConnectedReceiver.hasConnection(config.sendOnlyWithWifi)
+            || serverStatus.value === ServerStatus.DISABLED
+            || !networkConnectedReceiver.latestState.hasConnection(config.sendOnlyWithWifi)
             || batteryLevelReceiver.stage == BatteryStageReceiver.BatteryStage.EMPTY
         ) {
             when {
                 config.submitterConfig.userId == null ->
                     logger.info("Submitter has no user ID set. Not starting.")
-                status === ServerStatusListener.Status.DISABLED ->
+
+                serverStatus.value === ServerStatus.DISABLED ->
                     logger.info("Submitter has been disabled earlier. Not starting")
-                !networkConnectedReceiver.hasConnection(config.sendOnlyWithWifi) ->
+
+                !networkConnectedReceiver.latestState.hasConnection(config.sendOnlyWithWifi) ->
                     logger.info("No networkconnection available. Not starting")
+
                 batteryLevelReceiver.stage == BatteryStageReceiver.BatteryStage.EMPTY ->
                     logger.info("Battery is empty. Not starting")
             }
@@ -166,64 +198,84 @@ class TableDataHandler(
 
         val kafkaConfig = config.restConfig.kafkaConfig ?: return@executeReentrant
 
-        updateServerStatus(ServerStatusListener.Status.CONNECTING)
+        serverStatus.value = ServerStatus.CONNECTING
 
-        val client = RestClient.global()
-            .server(kafkaConfig)
-            .gzipCompression(config.restConfig.useCompression)
-            .timeout(config.restConfig.connectionTimeout, TimeUnit.SECONDS)
-            .build()
+        val kafkaUrl: String = kafkaConfig.urlString
 
-        val sender = RestSender.Builder().apply {
-            httpClient(client)
-            schemaRetriever(config.restConfig.schemaRetriever)
-            headers(config.restConfig.headers)
-            useBinaryContent(config.restConfig.hasBinaryContent)
-        }.build().also {
+        val kafkaSender = restKafkaSender {
+            val currentRestConfig = config.restConfig
+            baseUrl = kafkaUrl
+            headers.appendAll(currentRestConfig.headers)
+            httpClient {
+                timeout(currentRestConfig.connectionTimeout.seconds)
+                contentType = if (currentRestConfig.hasBinaryContent) {
+                    KAFKA_REST_BINARY_ENCODING
+                } else {
+                    KAFKA_REST_JSON_ENCODING
+                }
+                if (currentRestConfig.useCompression) {
+                    contentEncoding = GZIP_CONTENT_ENCODING
+                }
+                if (currentRestConfig.unsafeKafka) {
+                    unsafeSsl()
+                }
+            }
+            currentRestConfig.schemaRetrieverUrl?.let { schemaUrl ->
+                schemaRetriever(schemaUrl) {
+                    schemaTimeout = CacheConfig(
+                        refreshDuration = 2.hours,
+                        retryDuration = 30.seconds
+                    )
+                    httpClient = HttpClient(CIO) {
+                        timeout(10.seconds)
+                    }
+                }
+            }
+        }.also {
             sender = it
         }
 
-        this.submitter = KafkaDataSubmitter(this, sender, config.submitterConfig)
+        this.submitter = KafkaDataSubmitter(this, kafkaSender, config.submitterConfig)
     }
 
     /**
      * Pause sending any data.
      * This waits for any remaining data to be sent.
      */
-    fun stop() = handlerThread.executeReentrant {
+    fun pause() = handlerExecutor.executeReentrant {
         submitter?.close()
         submitter = null
         sender = null
-        if (status != ServerStatusListener.Status.DISABLED) {
-            updateServerStatus(ServerStatusListener.Status.READY)
+        if (serverStatus.value != ServerStatus.DISABLED) {
+            serverStatus.value = ServerStatus.READY
         }
     }
 
     /** Do not submit any data, only cache it. If it is already disabled, this does nothing.  */
-    private fun disableSubmitter() = handlerThread.executeReentrant {
-        if (status !== ServerStatusListener.Status.DISABLED) {
+    private fun disableSubmitter() = handlerExecutor.executeReentrant {
+        if (serverStatus.value !== ServerStatus.DISABLED) {
             logger.info("Submitter is disabled")
-            updateServerStatus(ServerStatusListener.Status.DISABLED)
+            serverStatus.value = ServerStatus.DISABLED
             if (isStarted) {
-                stop()
+                pause()
             }
-            networkConnectedReceiver.unregister()
+            networkStateCollectorJob?.cancel()
             batteryLevelReceiver.unregister()
         }
     }
 
     /** Start submitting data. If it is already submitting data, this does nothing.  */
-    private fun enableSubmitter() = handlerThread.executeReentrant {
-        if (status === ServerStatusListener.Status.DISABLED) {
+    private fun enableSubmitter() = handlerExecutor.executeReentrant {
+        if (serverStatus.value === ServerStatus.DISABLED) {
             doEnableSubmitter()
             start()
         }
     }
 
-    private fun doEnableSubmitter() {
+    private suspend fun doEnableSubmitter() {
         logger.info("Submitter is enabled")
-        updateServerStatus(ServerStatusListener.Status.READY)
-        networkConnectedReceiver.register()
+        serverStatus.value = ServerStatus.READY
+        startMonitoring()
         batteryLevelReceiver.register()
     }
 
@@ -232,18 +284,19 @@ class TableDataHandler(
      * @throws IOException if the tables cannot be flushed
      */
     @Throws(IOException::class)
-    fun close() {
-        handlerThread.stop {
-            if (status !== ServerStatusListener.Status.DISABLED) {
-                networkConnectedReceiver.unregister()
-                batteryLevelReceiver.unregister()
-            }
-            this.submitter?.close()
-            this.submitter = null
-            this.sender = null
+    suspend fun stop() {
+        if (serverStatus.value !== ServerStatus.DISABLED) {
+            networkStateCollectorJob?.cancel()
+            batteryLevelReceiver.unregister()
         }
+        this.submitter?.close()
+        this.submitter = null
+        this.sender = null
 
-        tables.values.forEach(DataCacheGroup<*, *>::close)
+        tables.values.launchJoin{
+            it.stop()
+        }
+        handlerExecutor.stop()
     }
 
     /**
@@ -254,131 +307,147 @@ class TableDataHandler(
     }
 
     override val caches: List<ReadableDataCache>
-        get() {
-            val caches = ArrayList<ReadableDataCache>(tables.size)
+        get() = buildList(tables.size) {
             tables.values.forEach {
-                caches += it.activeDataCache
-                caches += it.deprecatedCaches
+                add(it.activeDataCache)
+                addAll(it.deprecatedCaches)
             }
-            return caches
         }
 
     override val activeCaches: List<DataCacheGroup<*, *>>
-        get() = handlerThread.compute {
-            if (submitter == null) {
-                emptyList()
-            } else if (networkConnectedReceiver.state.hasWifiOrEthernet || !config.sendOverDataHighPriority) {
-                ArrayList(tables.values)
-            } else {
-                tables.values.filter { it.topicName in config.highPriorityTopics }
-            }
+        get() = if (submitter == null) {
+            emptyList()
+        } else if (networkConnectedReceiver.latestState.hasWifiOrEthernet || !config.sendOverDataHighPriority) {
+            ArrayList(tables.values)
+        } else {
+            tables.values.filter { it.topicName in config.highPriorityTopics }
         }
 
-    var statusListener: ServerStatusListener? = null
-        get() = handlerThread.compute { field }
-        set(value) = handlerThread.execute { field = value }
-
-    override fun updateServerStatus(status: ServerStatusListener.Status) {
-        latestStatus = status
-        handlerThread.executeReentrant {
-            val localLatestStatus = latestStatus
-            if (localLatestStatus != this.status) {
-                statusListener?.updateServerStatus(localLatestStatus)
-                this.status = localLatestStatus
-            }
-        }
-    }
-
-    override fun updateRecordsSent(topicName: String, numberOfRecords: Long) {
-        handlerThread.execute {
-            statusListener?.updateRecordsSent(topicName, numberOfRecords)
-
-            // Overwrite key-value if exists. Only stores the last
-            this.lastNumberOfRecordsSent[topicName] = numberOfRecords
-
-            if (numberOfRecords < 0) {
-                logger.warn("{} has FAILED uploading", topicName)
-            } else {
-                logger.info("{} uploaded {} records", topicName, numberOfRecords)
-            }
-        }
+    override suspend fun flushCaches(successCallback: () -> Unit, errorCallback: () -> Unit) {
+        submitter
+            ?.flush(successCallback, errorCallback)
+            ?: errorCallback()
     }
 
     @Throws(IOException::class)
-    override fun <V: SpecificRecord> registerCache(
+    override suspend fun <V : SpecificRecord> registerCache(
         topic: AvroTopic<ObservationKey, V>,
-        handler: SafeHandler?,
     ): DataCache<ObservationKey, V> {
         return cacheStore
-                .getOrCreateCaches(context.applicationContext, topic, config.cacheConfig, handler)
-                .also { tables[topic.name] = it }
-                .activeDataCache
+            .getOrCreateCaches(context.applicationContext, topic, config.cacheConfig)
+            .also { tables[topic.name] = it }
+            .activeDataCache
     }
 
-    override fun handler(build: DataHandlerConfiguration.() -> Unit) = handlerThread.executeReentrant {
-        val oldConfig = config
+    override fun handler(build: DataHandlerConfiguration.() -> Unit) =
+        handlerExecutor.executeReentrant {
+            val oldConfig = config
 
-        config = config.copy().apply(build)
-        if (config == oldConfig) {
-            return@executeReentrant
-        }
-
-        if (config.restConfig.kafkaConfig != null
-                && config.restConfig.schemaRetriever != null
-                && config.submitterConfig.userId != null) {
-            enableSubmitter()
-        } else {
-            if (config.restConfig.kafkaConfig == null) {
-                logger.info("No kafka configuration given. Disabling submitter")
+            config = config.copy().apply(build)
+            if (config == oldConfig) {
+                return@executeReentrant
             }
-            if (config.restConfig.schemaRetriever == null) {
-                logger.info("No schema registry configuration given. Disabling submitter")
-            }
-            if (config.submitterConfig.userId == null) {
-                logger.info("No user ID given. Disabling submitter")
-            }
-            disableSubmitter()
-        }
 
-        if (config.cacheConfig != oldConfig.cacheConfig) {
-            tables.values.forEach { it.activeDataCache.config = config.cacheConfig }
-        }
-
-        if (config.submitterConfig != oldConfig.submitterConfig) {
-            when {
-                config.submitterConfig.userId == null -> disableSubmitter()
-                oldConfig.submitterConfig.userId == null -> enableSubmitter()
-                else -> submitter?.config = config.submitterConfig
+            if (config.restConfig.kafkaConfig != null
+                && config.restConfig.schemaRetrieverUrl != null
+                && config.submitterConfig.userId != null
+            ) {
+                enableSubmitter()
+            } else {
+                if (config.restConfig.kafkaConfig == null) {
+                    logger.info("No kafka configuration given. Disabling submitter")
+                }
+                if (config.restConfig.schemaRetrieverUrl == null) {
+                    logger.info("No schema registry configuration given. Disabling submitter")
+                }
+                if (config.submitterConfig.userId == null) {
+                    logger.info("No user ID given. Disabling submitter")
+                }
+                disableSubmitter()
             }
-        }
 
-        if (config.restConfig != oldConfig.restConfig) {
-            val newRest = config.restConfig
-            newRest.kafkaConfig?.let { kafkaConfig ->
-                sender?.apply {
-                    setCompression(newRest.useCompression)
-                    setConnectionTimeout(newRest.connectionTimeout, TimeUnit.SECONDS)
-                    if (oldConfig.restConfig.hasBinaryContent != newRest.hasBinaryContent) {
-                        if (config.restConfig.hasBinaryContent) {
-                            useLegacyEncoding(RestSender.KAFKA_REST_ACCEPT_ENCODING, RestSender.KAFKA_REST_BINARY_ENCODING, true)
-                        } else {
-                            useLegacyEncoding(RestSender.KAFKA_REST_ACCEPT_ENCODING, RestSender.KAFKA_REST_AVRO_ENCODING, false)
-                        }
-                    }
-                    headers = config.restConfig.headers
-                    setKafkaConfig(kafkaConfig)
-                    resetConnection()
+            if (config.cacheConfig != oldConfig.cacheConfig) {
+                tables.values.forEach { it.activeDataCache.config.value = config.cacheConfig }
+            }
+
+            if (config.submitterConfig != oldConfig.submitterConfig) {
+                when {
+                    config.submitterConfig.userId == null -> disableSubmitter()
+                    oldConfig.submitterConfig.userId == null -> enableSubmitter()
+                    else -> submitter?.config = config.submitterConfig
                 }
             }
+
+            if (config.restConfig != oldConfig.restConfig) {
+                val newRest = config.restConfig
+                newRest.kafkaConfig?.let { kafkaConfig ->
+
+                    val contentTypeChanged: Boolean =
+                        oldConfig.restConfig.hasBinaryContent != newRest.hasBinaryContent
+
+                    sender = sender?.config {
+                        baseUrl = kafkaConfig.urlString
+                        headers.appendAll(newRest.headers)
+
+                        httpClient {
+                            timeout(newRest.connectionTimeout.seconds)
+                            if (contentTypeChanged) {
+                                contentType = if (config.restConfig.hasBinaryContent) {
+                                    KAFKA_REST_BINARY_ENCODING
+                                } else {
+                                    KAFKA_REST_JSON_ENCODING
+                                }
+                            }
+                            if (newRest.useCompression) {
+                                contentEncoding = GZIP_CONTENT_ENCODING
+                            }
+                            if (newRest.unsafeKafka) {
+                                unsafeSsl()
+                            }
+                        }
+                        val schemaRetrieverUrl = newRest.schemaRetrieverUrl
+                        if (schemaRetrieverUrl != oldConfig.restConfig.schemaRetrieverUrl) {
+                            schemaRetrieverUrl?.let { srUrl ->
+                                schemaRetriever(srUrl) {
+                                    schemaTimeout = CacheConfig(
+                                        refreshDuration = 2.hours,
+                                        retryDuration = 30.seconds
+                                    )
+                                    httpClient = HttpClient(CIO) {
+                                        timeout(10.seconds)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    sender?.resetConnection()
+                }
+            }
+
+            batteryLevelReceiver.stageLevels = config.batteryStageLevels
+
+            networkConnectedReceiver.latestState.also { state ->
+                if (isStarted) {
+                    if (!state.hasConnection(config.sendOnlyWithWifi)) {
+                        logger.info("Network was disconnected, stopping data sending.")
+                        pause()
+                    }
+                } else {
+                    // Just try to start: the start method will not do anything if the parameters
+                    // are not right.
+                    start()
+                }
+            }
+            start()
         }
-
-        batteryLevelReceiver.stageLevels = config.batteryStageLevels
-
-        networkConnectedReceiver.notifyListener()
-        start()
-    }
 
     companion object {
         private val logger = LoggerFactory.getLogger(TableDataHandler::class.java)
     }
+
+    data class CacheSize(
+        val topicName: String,
+        val numberOfRecords: Long,
+    )
 }

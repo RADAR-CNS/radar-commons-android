@@ -18,13 +18,16 @@ package org.radarbase.android.source
 
 import androidx.annotation.CallSuper
 import androidx.annotation.Keep
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import org.apache.avro.specific.SpecificRecord
 import org.radarbase.android.RadarConfiguration
 import org.radarbase.android.RadarConfiguration.Companion.SOURCE_ID_KEY
 import org.radarbase.android.auth.SourceMetadata
 import org.radarbase.android.data.DataCache
 import org.radarbase.android.util.ChangeRunner
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.topic.AvroTopic
 import org.radarcns.kafka.ObservationKey
 import org.slf4j.LoggerFactory
@@ -122,8 +125,7 @@ abstract class AbstractSourceManager<S : SourceService<T>, T : BaseSourceState>(
      * @return created topic
      */
     protected fun <V : SpecificRecord> createCache(
-            name: String, valueClass: V,
-            handler: SafeHandler? = null,
+        name: String, valueClass: V,
     ): DataCache<ObservationKey, V> {
         try {
             val topic = AvroTopic(
@@ -133,7 +135,8 @@ abstract class AbstractSourceManager<S : SourceService<T>, T : BaseSourceState>(
                 ObservationKey::class.java,
                 valueClass::class.java,
             )
-            return dataHandler.registerCache(topic, handler)
+            val cache = runBlocking{  dataHandler.registerCache(topic) }
+            return cache
         } catch (e: ReflectiveOperationException) {
             logger.error("Error creating topic {}", name, e)
             throw RuntimeException(e)
@@ -147,10 +150,11 @@ abstract class AbstractSourceManager<S : SourceService<T>, T : BaseSourceState>(
      * Send a single record, using the cache to persist the data.
      * If the current source is not registered when this is called, the data will NOT be sent.
      */
-    protected fun <V : SpecificRecord> send(dataCache: DataCache<ObservationKey, V>, value: V) {
+    protected suspend fun <V : SpecificRecord> send(dataCache: DataCache<ObservationKey, V>, value: V) {
         val key = state.id
-        if (key.getSourceId() != null) {
+        if (key.sourceId != null) {
             try {
+
                 dataCache.addMeasurement(key, value)
             } catch (ex: IllegalArgumentException) {
                 logger.error("Cannot send for {} to dataCache {}: {}", state.id, dataCache.topic.name, ex)
@@ -163,7 +167,7 @@ abstract class AbstractSourceManager<S : SourceService<T>, T : BaseSourceState>(
 
     @CallSuper
     override fun didRegister(source: SourceMetadata) {
-        state.id.setSourceId(source.sourceId)
+        state.id.sourceId = source.sourceId
     }
 
     /**

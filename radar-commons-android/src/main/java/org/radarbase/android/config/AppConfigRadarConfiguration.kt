@@ -2,54 +2,59 @@ package org.radarbase.android.config
 
 import android.content.Context
 import android.content.Context.MODE_PRIVATE
-import android.os.Process.THREAD_PRIORITY_BACKGROUND
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.Response
-import org.json.JSONArray
-import org.json.JSONObject
+import io.ktor.client.*
+import io.ktor.client.call.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.*
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.client.request.*
+import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import org.radarbase.android.RadarConfiguration
 import org.radarbase.android.RadarConfiguration.Companion.BASE_URL_KEY
 import org.radarbase.android.RadarConfiguration.Companion.OAUTH2_CLIENT_ID
 import org.radarbase.android.RadarConfiguration.Companion.UNSAFE_KAFKA_CONNECTION
 import org.radarbase.android.auth.AppAuthState
-import org.radarbase.android.util.ServerConfigUtil.toServerConfig
-import org.radarbase.android.util.ChangeRunner
 import org.radarbase.android.util.DelayedRetry
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.ServerConfigUtil.toServerConfig
+import org.radarbase.appconfig.api.ClientConfig
 import org.radarbase.config.ServerConfig
-import org.radarbase.producer.rest.RestClient
+import org.radarbase.producer.io.timeout
+import org.radarbase.producer.io.unsafeSsl
 import org.slf4j.LoggerFactory
 import java.io.IOException
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.time.Duration.Companion.seconds
 
 @Suppress("unused")
-class AppConfigRadarConfiguration(context: Context) : RemoteConfig {
+class AppConfigRadarConfiguration(
+    context: Context,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+) : RemoteConfig {
     private var auth: AppAuthState? = null
     private var config: SingleRadarConfiguration? = null
-    private val handler = SafeHandler.getInstance("appconfig", THREAD_PRIORITY_BACKGROUND).apply {
-        if (!isStarted) {
-            start()
-        }
-    }
     private val retryDelay = DelayedRetry(minDelay = 10_000L, maxDelay = 3_600_000L)
+    private val job = SupervisorJob()
+    private val appconfigScope = CoroutineScope(coroutineContext + job)
 
     @get:Synchronized
     private var appConfig: AppConfigClientConfig? = null
 
-    private var statusChangeRunner = ChangeRunner(RadarConfiguration.RemoteConfigStatus.INITIAL)
-
-    override var status: RadarConfiguration.RemoteConfigStatus
-        get() = statusChangeRunner.value
-        private set(value) {
-            statusChangeRunner.applyIfChanged(value) {
-                handler.execute {
-                    logger.info("Updating status to {}", value)
-                    this.onStatusUpdateListener(value)
-                }
-            }
-        }
-
-    override var onStatusUpdateListener: (RadarConfiguration.RemoteConfigStatus) -> Unit = {}
+    override var status = MutableStateFlow(RadarConfiguration.RemoteConfigStatus.INITIAL)
 
     private val preferences = context.getSharedPreferences(
         "org.radarbase.android.config.AppConfigRadarConfiguration",
@@ -65,96 +70,112 @@ class AppConfigRadarConfiguration(context: Context) : RemoteConfig {
     @Volatile
     override var lastFetch: Long = 0L
 
-    private var client: RestClient? = null
+    private var client: HttpClient? = null
+
+    private val configMutex = Mutex()
 
     init {
         lastFetch = preferences.getLong(LAST_FETCH, 0L)
-        if (lastFetch != 0L) {
-            status = RadarConfiguration.RemoteConfigStatus.FETCHED
+        val storageIsAlreadyFetched = lastFetch != 0L
+        if (storageIsAlreadyFetched) {
+            status.value = RadarConfiguration.RemoteConfigStatus.FETCHED
+        }
+        appconfigScope.launch {
+            val statusFlow = if (storageIsAlreadyFetched) status.drop(1) else status
+            statusFlow
+                .filter { it == RadarConfiguration.RemoteConfigStatus.FETCHED }
+                .collect { storeCache() }
         }
     }
 
-    override fun doFetch(maxCacheAge: Long) = handler.execute {
-        val (client, appConfig) = synchronized(this) {
+    override suspend fun doFetch(maxCacheAge: Long) {
+        val (client, appConfig) = configMutex.withLock {
             Pair(client, appConfig)
         }
         if (appConfig == null || client == null) {
             logger.warn("Cannot fetch configuration without AppConfig client configuration")
-            status = RadarConfiguration.RemoteConfigStatus.UNAVAILABLE
-            return@execute
+            status.value = RadarConfiguration.RemoteConfigStatus.UNAVAILABLE
+            return
         }
-        val request = client.requestBuilder("projects/${appConfig.appAuthState.projectId}/users/${appConfig.appAuthState.userId}/config/${appConfig.clientId}")
-                .build()
 
-        status = RadarConfiguration.RemoteConfigStatus.FETCHING
+        status.value = RadarConfiguration.RemoteConfigStatus.FETCHING
 
-        client.httpClient.newCall(request).enqueue(object : Callback {
-            override fun onResponse(call: Call, response: Response) {
-                status = try {
-                    val body = response.body
-                    if (response.isSuccessful && body != null) {
-                        logger.info("Successfully fetched app config body")
-                        val json = JSONObject(body.string())
+        val statement = client.prepareRequest("projects/${appConfig.appAuthState.projectId}/users/${appConfig.appAuthState.userId}/clients/${appConfig.clientId}") {
+            headers {
+                appendAll(appConfig.appAuthState.ktorHeaders)
+            }
+        }
 
-                        cache = HashMap<String, String>().apply {
-                            json.optJSONArray("defaults")?.let { mergeConfig(it) }
-                            json.optJSONArray("config")?.let { mergeConfig(it) }
+        status.value = withContext(Dispatchers.IO) {
+            try {
+                val response = statement.execute()
+                when {
+                    response.status.isSuccess() -> {
+                        val body: ClientConfig = response.body()
+
+                        cache = buildMap {
+                            body.defaults?.forEach {
+                                val value = it.value ?: return@forEach
+                                put(it.name, value)
+                            }
+                            body.config.forEach {
+                                val value = it.value
+                                if (value.isNullOrEmpty()) {
+                                    remove(it.name)
+                                } else {
+                                    put(it.name, value)
+                                }
+                            }
                         }
-                        lastFetch = System.currentTimeMillis()
-
-                        retryDelay.reset()
                         RadarConfiguration.RemoteConfigStatus.FETCHED
-                    } else if (response.code == 404) {
-                        logger.warn("Cannot query appconfig at {}. Disabling app-config.", request.url)
+                    }
+                    response.status == HttpStatusCode.NotFound -> {
+                        logger.warn("AppConfig service not found")
                         RadarConfiguration.RemoteConfigStatus.UNAVAILABLE
-                    } else {
-                        logger.error("Failed to fetch remote config using {} (HTTP status {}): {}",
-                                call.request(), response.code, response.body?.string())
-                        retryLater(appConfig)
-                        RadarConfiguration.RemoteConfigStatus.ERROR
                     }
-                } catch (ex: java.lang.Exception) {
-                    logger.error("Failed to parse remote config", ex)
-                    retryLater(appConfig)
-                    RadarConfiguration.RemoteConfigStatus.ERROR
-                } finally {
-                    response.close()
+                    else -> throw IOException("AppConfig update request failed with code ${response.status}")
                 }
-
-                preferences.edit().apply {
-                    cache.entries.forEach { (k, v) ->
-                        putString(k, v)
-                    }
-                    putLong(LAST_FETCH, lastFetch)
-                }.apply()
-            }
-
-            override fun onFailure(call: Call, e: IOException) {
-                logger.error("AppConfig update request failed", e)
-                status = RadarConfiguration.RemoteConfigStatus.ERROR
+            } catch (ex: Exception) {
+                logger.error("AppConfig update request failed", ex)
                 retryLater(appConfig)
+                RadarConfiguration.RemoteConfigStatus.ERROR
             }
-        })
+        }
     }
 
-    private fun retryLater(appConfig: AppConfigClientConfig) {
-        handler.delay(retryDelay.nextDelay()) {
+    private suspend fun storeCache() {
+        withContext(Dispatchers.IO) {
+            preferences.edit().apply {
+                cache.entries.forEach { (k, v) ->
+                    putString(k, v)
+                }
+                putLong(LAST_FETCH, lastFetch)
+            }.commit()
+        }
+    }
+
+    private suspend fun retryLater(appConfig: AppConfigClientConfig) {
+        appconfigScope.launch {
+            delay(retryDelay.nextDelay())
             fetch(appConfig.fetchTimeout)
         }
     }
 
-    override fun updateWithAuthState(appAuthState: AppAuthState?) {
-        auth = appAuthState
-        updateConfiguration(appAuthState, config)
+    override suspend fun updateWithAuthState(appAuthState: AppAuthState?) {
+        configMutex.withLock {
+            auth = appAuthState
+            updateConfiguration(appAuthState, config)
+        }
     }
 
-    override fun updateWithConfig(config: SingleRadarConfiguration?) {
-        this.config = config
-        updateConfiguration(auth, config)
+    override suspend fun updateWithConfig(config: SingleRadarConfiguration?) {
+        configMutex.withLock {
+            this.config = config
+            updateConfiguration(auth, config)
+        }
     }
 
-    @Synchronized
-    private fun updateConfiguration(auth: AppAuthState?, config: SingleRadarConfiguration?) {
+    private suspend fun updateConfiguration(auth: AppAuthState?, config: SingleRadarConfiguration?) {
         val appConfig = config?.let { value ->
             val serverConfig = value.optString(BASE_URL_KEY) { baseUrl ->
                 "$baseUrl/appconfig/api/".toServerConfig(
@@ -173,16 +194,29 @@ class AppConfigRadarConfiguration(context: Context) : RemoteConfig {
         logger.info("AppConfig config {}", appConfig)
         this.appConfig = appConfig
         if (appConfig != null) {
-            status = RadarConfiguration.RemoteConfigStatus.READY
-            client = (client?.newBuilder() ?: RestClient.global())
-                    .headers(appConfig.appAuthState.okHttpHeaders)
-                    .server(appConfig.serverConfig)
-                    .build()
+            status.value = RadarConfiguration.RemoteConfigStatus.READY
+            client = baseClient.config {
+                defaultRequest {
+                    url(appConfig.serverConfig.urlString)
+                    headers {
+                        appendAll(appConfig.appAuthState.ktorHeaders)
+                    }
+                    accept(ContentType.Application.Json)
+                }
+                if (appConfig.serverConfig.isUnsafe) {
+                    unsafeSsl()
+                }
+            }
             fetch(appConfig.fetchTimeout)
         } else {
-            status = RadarConfiguration.RemoteConfigStatus.UNAVAILABLE
+            status.value = RadarConfiguration.RemoteConfigStatus.UNAVAILABLE
             client = null
         }
+    }
+
+    override suspend fun stop() {
+        job.cancelAndJoin()
+        baseClient.close()
     }
 
     private data class AppConfigClientConfig(
@@ -196,17 +230,14 @@ class AppConfigRadarConfiguration(context: Context) : RemoteConfig {
         private val logger = LoggerFactory.getLogger(AppConfigRadarConfiguration::class.java)
         private const val LAST_FETCH = "org.radarbase.android.config.AppConfigRadarConfiguration.lastFetch"
 
-        private fun MutableMap<String, String>.mergeConfig(configs: JSONArray) {
-            for (index in 0 until configs.length()) {
-                val singleConfig = configs.getJSONObject(index)
-                val name = singleConfig.getString("name")
-                val value = singleConfig.optString("value")
-                if (value.isEmpty()) {
-                    remove(name)
-                } else {
-                    put(name, value)
-                }
+
+        private val baseClient: HttpClient = HttpClient(CIO) {
+            install(ContentNegotiation) {
+                json(Json {
+                    ignoreUnknownKeys = true
+                })
             }
+            timeout(10.seconds)
         }
     }
 }

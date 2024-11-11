@@ -16,14 +16,13 @@
 
 package org.radarbase.passive.audio
 
-import android.os.Process
 import android.util.Base64
 import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.BaseSourceState
 import org.radarbase.android.source.SourceStatusListener
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.OfflineProcessor
-import org.radarbase.android.util.SafeHandler
 import org.radarbase.passive.audio.OpenSmileAudioService.Companion.DEFAULT_RECORD_RATE
 import org.radarbase.passive.audio.opensmile.SmileJNI
 import org.radarcns.kafka.ObservationKey
@@ -34,7 +33,7 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /** Manages Phone sensors  */
-class OpensmileAudioManager constructor(service: OpenSmileAudioService) : AbstractSourceManager<OpenSmileAudioService, BaseSourceState>(service) {
+class OpensmileAudioManager(service: OpenSmileAudioService) : AbstractSourceManager<OpenSmileAudioService, BaseSourceState>(service) {
     private val audioTopic: DataCache<ObservationKey, OpenSmile2PhoneAudio> = createCache("android_processed_audio", OpenSmile2PhoneAudio())
 
     @get:Synchronized
@@ -44,6 +43,7 @@ class OpensmileAudioManager constructor(service: OpenSmileAudioService) : Abstra
     private val processor: OfflineProcessor
     private var isRunning: Boolean = false
     private val dataDirectory: File?
+    private val audioTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
 
     init {
         name = service.getString(R.string.header_audio_status)
@@ -53,7 +53,6 @@ class OpensmileAudioManager constructor(service: OpenSmileAudioService) : Abstra
             requestCode = AUDIO_REQUEST_CODE
             requestName = AUDIO_REQUEST_NAME
             interval(DEFAULT_RECORD_RATE, TimeUnit.SECONDS)
-            handler(SafeHandler.getInstance("RADARAudio", Process.THREAD_PRIORITY_BACKGROUND))
             wake = true
         }
         val externalDirectory = service.filesDir
@@ -69,6 +68,7 @@ class OpensmileAudioManager constructor(service: OpenSmileAudioService) : Abstra
     }
 
     override fun start(acceptableIds: Set<String>) {
+        audioTaskExecutor.start()
         isRunning = true
         processor.start {
             SmileJNI.init(service)
@@ -78,7 +78,7 @@ class OpensmileAudioManager constructor(service: OpenSmileAudioService) : Abstra
         status = SourceStatusListener.Status.CONNECTED
     }
 
-    private fun processAudio() {
+    private suspend fun processAudio() {
         status = SourceStatusListener.Status.CONNECTED
         logger.info("Setting up audio recording")
         val dataPath = File(dataDirectory, "audio_" + System.currentTimeMillis() + ".bin")
@@ -115,7 +115,9 @@ class OpensmileAudioManager constructor(service: OpenSmileAudioService) : Abstra
 
     override fun onClose() {
         if (isRunning) {
-            processor.close()
+            audioTaskExecutor.stop {
+                processor.stop()
+            }
         }
         clearDataDirectory()
     }

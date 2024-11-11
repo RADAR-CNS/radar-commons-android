@@ -16,17 +16,19 @@
 
 package org.radarbase.android.data
 
+import kotlinx.coroutines.flow.StateFlow
+import org.apache.avro.Schema
 import org.radarbase.android.data.serialization.SerializationFactory
 import org.radarbase.data.RecordData
 import org.radarbase.topic.AvroTopic
-import java.io.Closeable
 import java.io.File
 import java.io.IOException
 
-interface ReadableDataCache : Closeable {
+interface ReadableDataCache {
     /** Get the topic the cache stores.  */
     val readTopic: AvroTopic<Any, Any>
     val serialization: SerializationFactory
+    val readUserIdField: Schema.Field?
 
     val file: File
     /**
@@ -37,7 +39,7 @@ interface ReadableDataCache : Closeable {
      * @return records or null if none are found.
      */
     @Throws(IOException::class)
-    fun getUnsentRecords(limit: Int, sizeLimit: Long): RecordData<Any, Any?>?
+    suspend fun getUnsentRecords(limit: Int, sizeLimit: Long): RecordData<Any, Any>?
 
     /**
      * Get latest records in the cache, from new to old.
@@ -45,17 +47,19 @@ interface ReadableDataCache : Closeable {
      * @return records or null if none are found.
      */
     @Throws(IOException::class)
-    fun getRecords(limit: Int): RecordData<Any, Any>?
+    suspend fun getRecords(limit: Int): RecordData<Any, Any>?
 
     /**
      * Number of unsent records in cache.
      */
-    val numberOfRecords: Long
+    val numberOfRecords: StateFlow<Long>
 
     /**
      * Remove oldest records.
      * @param number number of records (inclusive) to remove.
      */
     @Throws(IOException::class)
-    fun remove(number: Int)
+    suspend fun remove(number: Int)
+
+    suspend fun stop()
 }

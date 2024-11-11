@@ -22,7 +22,6 @@ import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.os.Process
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.ActivityRecognition
 import com.google.android.gms.location.SleepClassifyEvent
@@ -32,7 +31,7 @@ import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.BaseSourceState
 import org.radarbase.android.source.SourceStatusListener
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.toPendingIntentFlag
 import org.radarbase.passive.google.sleep.GoogleSleepProvider.Companion.ACTIVITY_RECOGNITION_COMPAT
 import org.radarcns.kafka.ObservationKey
@@ -42,26 +41,32 @@ import org.radarcns.passive.google.SleepClassificationStatus
 import org.slf4j.LoggerFactory
 
 class GoogleSleepManager(context: GoogleSleepService) : AbstractSourceManager<GoogleSleepService, BaseSourceState>(context) {
-    private val segmentEventTopic: DataCache<ObservationKey, GoogleSleepSegmentEvent> = createCache("android_google_sleep_segment_event", GoogleSleepSegmentEvent())
-    private val classifyEventTopic: DataCache<ObservationKey, GoogleSleepClassifyEvent> = createCache("android_google_sleep_classify_event", GoogleSleepClassifyEvent())
+    private val segmentEventTopic: DataCache<ObservationKey, GoogleSleepSegmentEvent> = createCache(
+        "android_google_sleep_segment_event",
+        GoogleSleepSegmentEvent()
+    )
+    private val classifyEventTopic: DataCache<ObservationKey, GoogleSleepClassifyEvent> = createCache(
+        "android_google_sleep_classify_event",
+        GoogleSleepClassifyEvent()
+    )
 
     private val sleepBroadcastReceiver: BroadcastReceiver
-    private val sleepHandler = SafeHandler.getInstance("Google Sleep", Process.THREAD_PRIORITY_BACKGROUND)
+    private val sleepTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
     private val sleepPendingIntent: PendingIntent
     private val isPermissionGranted
     get() = ContextCompat.checkSelfPermission(service,ACTIVITY_RECOGNITION_COMPAT) == PackageManager.PERMISSION_GRANTED
 
     init {
         name = context.getString(R.string.googleSleepDisplayName)
-        sleepBroadcastReceiver = SleepReceiver(this)
+        sleepBroadcastReceiver = SleepReceiver(this, sleepTaskExecutor)
         sleepPendingIntent = createSleepPendingIntent()
     }
 
     override fun start(acceptableIds: Set<String>) {
         register()
-        sleepHandler.start()
+        sleepTaskExecutor.start()
         status = SourceStatusListener.Status.READY
-        sleepHandler.execute {
+        sleepTaskExecutor.execute {
             registerSleepReceiver()
             registerForSleepData()
         }
@@ -73,7 +78,7 @@ class GoogleSleepManager(context: GoogleSleepService) : AbstractSourceManager<Go
         logger.info("registering for the sleep receiver.")
     }
 
-     fun sendSleepSegmentData(sleepIntent: Intent) {
+     suspend fun sendSleepSegmentData(sleepIntent: Intent) {
         logger.info("Sleep segment event data received")
         val sleepSegmentEvents: List<SleepSegmentEvent> = SleepSegmentEvent.extractEvents(sleepIntent)
         sleepSegmentEvents.forEach { sleepSegmentEvent ->
@@ -86,7 +91,7 @@ class GoogleSleepManager(context: GoogleSleepService) : AbstractSourceManager<Go
         }
     }
 
-     fun sendSleepClassifyData(sleepIntent: Intent) {
+     suspend fun sendSleepClassifyData(sleepIntent: Intent) {
         logger.info("Sleep classify event data received")
         val sleepClassifyEvents: List<SleepClassifyEvent> = SleepClassifyEvent.extractEvents(sleepIntent)
         sleepClassifyEvents.forEach {  sleepClassifyEvent ->
@@ -151,7 +156,7 @@ class GoogleSleepManager(context: GoogleSleepService) : AbstractSourceManager<Go
     }
 
     override fun onClose() {
-        sleepHandler.stop {
+        sleepTaskExecutor.stop {
             unRegisterFromSleepData()
             unRegisterSleepReceiver()
         }

@@ -27,13 +27,22 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Debug
 import android.os.PowerManager
-import android.os.Process.THREAD_PRIORITY_BACKGROUND
 import android.os.SystemClock
-import org.radarbase.util.CountedReference
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import org.radarbase.kotlin.coroutines.forkJoin
 import org.slf4j.LoggerFactory
-import java.io.Closeable
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 
 /**
  * Process events based on a alarm. The events will be processed in a background Thread.
@@ -44,41 +53,40 @@ import java.util.concurrent.TimeUnit
  */
 class OfflineProcessor(
     private val context: Context,
-    private val config: ProcessorConfiguration,
-) : Closeable {
+    config: ProcessorConfiguration,
+) {
 
     constructor(
         context: Context,
         config: ProcessorConfiguration.() -> Unit,
     ) : this(context, ProcessorConfiguration().apply(config))
 
+    private val config = config.copy()
     private val receiver: BroadcastReceiver
     private val pendingIntent: PendingIntent
     private val alarmManager: AlarmManager
-    private val handler: SafeHandler
+    private val job = SupervisorJob()
+    private val processorScope = CoroutineScope(config.coroutineContext + job)
 
     private val requestName: String = requireNotNull(config.requestName) { "Cannot start processor without request name" }
-    private val process: List<() -> Unit> = ArrayList(config.process)
+    private val process: List<suspend () -> Unit> = ArrayList(config.process)
+
+    private val _isDone = AtomicBoolean(false)
 
     /** Whether the processing Runnable should stop execution.  */
-    @get:Synchronized
-    var isDone: Boolean = false
+    val isDone: Boolean
+        get() = _isDone.get()
+
+    @Volatile
+    var isStarted: Boolean = false
         private set
 
-    private var didStart: Boolean = false
-
-    val isStarted: Boolean
-        get() = handler.compute { didStart }
-
-    private val isRunning: Semaphore
+    private val runningLock: Mutex
 
     init {
         require(process.isNotEmpty()) { "Cannot start processor without processes" }
-
-        this.isDone = false
         this.alarmManager = context.getSystemService(ALARM_SERVICE) as AlarmManager
 
-        handler = config.handlerReference.acquire()
         val intent = Intent(config.requestName)
         pendingIntent = PendingIntent.getBroadcast(
             context,
@@ -92,58 +100,42 @@ class OfflineProcessor(
                 trigger()
             }
         }
-        didStart = false
-        isRunning = Semaphore(1)
+        runningLock = Mutex()
     }
 
     /** Start processing.  */
-    fun start(initializer: (() -> Unit)? = null) {
-        handler.compute {
-            check(config.intervalMillis > 0) { "Cannot start processing without an interval" }
-        }
-        handler.execute {
-            didStart = true
-            context.registerReceiver(this.receiver, IntentFilter(requestName))
+    fun start(initializer: (suspend () -> Unit)? = null) {
+        processorScope.launch {
+            isStarted = true
+            context.registerReceiver(receiver, IntentFilter(requestName))
             schedule()
-            initializer?.let { it() }
+            if (initializer != null) {
+                initializer()
+            }
         }
     }
 
     /** Start up a new thread to process.  */
     fun trigger() {
-        if (isDone) {
-            return
-        }
-        if (!isRunning.tryAcquire()) {
-            return
-        }
-        val wakeLock = if (config.wake) {
-            acquireWakeLock(context, requestName)
-        } else null
+        processorScope.launch {
+            runningLock.tryWithLock {
+                val wakeLock = if (config.wake) {
+                    acquireWakeLock(context, requestName)
+                } else null
 
-        try {
-            for (runnable in process) {
-                handler.execute {
-                    if (!isDone) {
+                try {
+                    process.forkJoin { runnable ->
                         try {
                             runnable()
-                        } catch (ex: InterruptedException) {
-                            logger.error("OfflineProcessor task was interrupted.", ex)
                         } catch (ex: Throwable) {
                             logger.error("OfflineProcessor task failed.", ex)
                         }
                     }
-                    if (Thread.interrupted()) {
-                        logger.debug("OfflineProcessor handler thread was interrupted but no blocking calls were invoked.")
-                    }
+                } catch (ex: RuntimeException) {
+                    logger.error("Handler thread is no longer running.", ex)
+                } finally {
+                    wakeLock?.release()
                 }
-            }
-        } catch (ex: RuntimeException) {
-            logger.error("Handler thread is no longer running.", ex)
-        } finally {
-            handler.execute(true) {
-                isRunning.release()
-                wakeLock?.release()
             }
         }
     }
@@ -155,14 +147,16 @@ class OfflineProcessor(
      */
     fun interval(duration: Long, timeUnit: TimeUnit) {
         require(duration > 0L) { "Duration must be positive" }
-        handler.execute(true) {
-            if (config.interval(duration, timeUnit) && didStart) {
-                schedule()
+        processorScope.launch {
+            runningLock.withLock {
+                if (config.interval(duration, timeUnit) && isStarted) {
+                    schedule()
+                }
             }
         }
     }
 
-    private fun schedule() {
+    private suspend fun schedule() {
         val runImmediately = Debug.isDebuggerConnected()
         val firstAlarm: Long = if (runImmediately) {
             trigger()
@@ -171,7 +165,9 @@ class OfflineProcessor(
             SystemClock.elapsedRealtime() + config.intervalMillis / 4
         }
         val type = if (config.wake) AlarmManager.ELAPSED_REALTIME_WAKEUP else AlarmManager.ELAPSED_REALTIME
-        alarmManager.setInexactRepeating(type, firstAlarm, config.intervalMillis, pendingIntent)
+        withContext(Dispatchers.IO) {
+            alarmManager.setInexactRepeating(type, firstAlarm, config.intervalMillis, pendingIntent)
+        }
     }
 
     /**
@@ -182,46 +178,40 @@ class OfflineProcessor(
      * The processing Runnable should query [.isDone] very regularly to stop execution
      * if that is the case.
      */
-    override fun close() {
-        synchronized(this) {
-            if (isDone) {
-                logger.info("OfflineProcessor attempted to be closed twice.")
-                return
-            }
-            isDone = true
+    suspend fun stop() {
+        if (!_isDone.compareAndSet(false, true)) {
+            logger.info("OfflineProcessor attempted to be closed twice.")
+            return
         }
-        handler.execute {
-            if (didStart) {
-                alarmManager.cancel(pendingIntent)
-                try {
-                    context.unregisterReceiver(receiver)
-                } catch (ex: IllegalArgumentException) {
-                    logger.warn(
-                        "Cannot unregister OfflineProcessor {}, it was most likely not completely started: {}",
-                        config.requestName,
-                        ex.message,
-                    )
+        job.cancelAndJoin()
+
+        if (isStarted) {
+            coroutineScope {
+                launch(Dispatchers.IO) {
+                    alarmManager.cancel(pendingIntent)
+                }
+                launch(Dispatchers.IO) {
+                    try {
+                        context.unregisterReceiver(receiver)
+                    } catch (ex: IllegalStateException) {
+                        logger.warn(
+                            "Cannot unregister OfflineProcessor {}, it was most likely not completely started: {}",
+                            config.requestName,
+                            ex.message,
+                        )
+                    }
                 }
             }
-        }
-
-        try {
-            isRunning.acquire()
-            config.handlerReference.release()
-        } catch (e: InterruptedException) {
-            logger.error("Interrupted while waiting for processing to finish.")
-            Thread.currentThread().interrupt()
         }
     }
 
     data class ProcessorConfiguration(
         var requestCode: Int? = null,
         var requestName: String? = null,
-        var process: List<() -> Unit> = emptyList(),
-        @get:Synchronized
+        var process: List<suspend () -> Unit> = emptyList(),
         var intervalMillis: Long = -1,
         var wake: Boolean = true,
-        var handlerReference: CountedReference<SafeHandler> = DEFAULT_HANDLER_THREAD
+        var coroutineContext: CoroutineContext = EmptyCoroutineContext,
     ) {
         @Synchronized
         fun interval(duration: Long, unit: TimeUnit): Boolean {
@@ -230,22 +220,10 @@ class OfflineProcessor(
             intervalMillis = unit.toMillis(duration)
             return oldInterval != intervalMillis
         }
-
-        fun handler(value: SafeHandler) {
-            handlerReference = value.toCountedReference()
-        }
     }
 
     companion object {
         private val logger = LoggerFactory.getLogger(OfflineProcessor::class.java)
-        private val safeHandler = SafeHandler("OfflineProcessor", THREAD_PRIORITY_BACKGROUND)
-        private val DEFAULT_HANDLER_THREAD = safeHandler.toCountedReference()
-
-        private fun SafeHandler.toCountedReference() = CountedReference({
-            apply { start() }
-        }, {
-            stop()
-        })
 
         @SuppressLint("WakelockTimeout")
         private fun acquireWakeLock(
@@ -256,6 +234,17 @@ class OfflineProcessor(
             val lock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, requestName)
             lock.acquire()
             return lock
+        }
+
+        private suspend fun <T> Mutex.tryWithLock(block: suspend () -> T): T? {
+            if (!tryLock()) {
+                return null
+            }
+            return try {
+                block()
+            } finally {
+                unlock()
+            }
         }
     }
 }

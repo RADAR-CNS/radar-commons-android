@@ -18,15 +18,15 @@ package org.radarbase.android
 
 import android.annotation.SuppressLint
 import android.content.Context
-import androidx.lifecycle.LiveData
+import kotlinx.coroutines.flow.StateFlow
 import org.radarbase.android.auth.AppAuthState
 import org.radarbase.android.config.SingleRadarConfiguration
 import java.util.*
 
 interface RadarConfiguration {
-    val status: RemoteConfigStatus
+    val status: StateFlow<RemoteConfigStatus>
     val latestConfig: SingleRadarConfiguration
-    val config: LiveData<SingleRadarConfiguration>
+    val config: StateFlow<SingleRadarConfiguration>
 
     enum class RemoteConfigStatus {
         UNAVAILABLE, INITIAL, ERROR, READY, FETCHING, FETCHED, PARTIALLY_FETCHED
@@ -44,29 +44,29 @@ interface RadarConfiguration {
      */
     fun put(key: String, value: Any): String?
 
-    fun persistChanges()
+    suspend fun persistChanges()
 
     /**
      * Reset configuration to remote config values. If no keys are given, all local
      * settings are reset, otherwise only the given keys are reset.
      * @param keys configuration names
      */
-    fun reset(vararg keys: String)
+    suspend fun reset(vararg keys: String)
 
     /**
      * Fetch the remote configuration from server if it is outdated.
      */
-    fun fetch()
+    suspend fun fetch()
 
     /**
      * Force fetching the remote configuration from server, even if it is not outdated.
      */
-    fun forceFetch()
+    suspend fun forceFetch()
 
     /**
      * Adds base URL from auth state to configuration.
      */
-    fun updateWithAuthState(context: Context, appAuthState: AppAuthState?)
+    suspend fun updateWithAuthState(context: Context, appAuthState: AppAuthState?)
 
     companion object {
         const val RADAR_CONFIGURATION_CHANGED = "org.radarcns.android.RadarConfiguration.CHANGED"

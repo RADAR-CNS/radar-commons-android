@@ -17,10 +17,10 @@
 package org.radarbase.android.config
 
 import org.radarbase.android.RadarConfiguration
+import org.radarbase.android.util.equalTo
 import java.util.*
-import java.util.regex.Pattern
-import java.util.regex.Pattern.CASE_INSENSITIVE
 
+@Suppress("unused")
 class SingleRadarConfiguration(val status: RadarConfiguration.RemoteConfigStatus, val config: Map<String, String>) {
     val keys: Set<String> = config.keys
 
@@ -114,8 +114,8 @@ class SingleRadarConfiguration(val status: RadarConfiguration.RemoteConfigStatus
     fun getBoolean(key: String): Boolean {
         val str = getString(key)
         return when {
-            IS_TRUE.matcher(str).find() -> true
-            IS_FALSE.matcher(str).find() -> false
+            IS_TRUE.matches(str) -> true
+            IS_FALSE.matches(str) -> false
             else -> throw NumberFormatException("String '$str' of property $key is not a boolean")
         }
     }
@@ -123,8 +123,8 @@ class SingleRadarConfiguration(val status: RadarConfiguration.RemoteConfigStatus
     fun getBoolean(key: String, defaultValue: Boolean): Boolean {
         val str = optString(key) ?: return defaultValue
         return when {
-            IS_TRUE.matcher(str).find() -> true
-            IS_FALSE.matcher(str).find() -> false
+            IS_TRUE.matches(str) -> true
+            IS_FALSE.matches(str) -> false
             else -> defaultValue
         }
     }
@@ -147,21 +147,16 @@ class SingleRadarConfiguration(val status: RadarConfiguration.RemoteConfigStatus
         }.toString()
     }
 
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (javaClass != other?.javaClass) return false
-
-        other as SingleRadarConfiguration
-
-        return status == other.status && config == other.config
-    }
+    override fun equals(other: Any?): Boolean = equalTo(
+        other,
+        SingleRadarConfiguration::status,
+        SingleRadarConfiguration::config,
+    )
 
     override fun hashCode(): Int = Objects.hash(status, config)
 
     companion object {
-        private val IS_TRUE = Pattern.compile(
-                "^(1|true|t|yes|y|on)$", CASE_INSENSITIVE)
-        private val IS_FALSE = Pattern.compile(
-                "^(0|false|f|no|n|off|)$", CASE_INSENSITIVE)
+        private val IS_TRUE = "1|true|t|yes|y|on".toRegex(RegexOption.IGNORE_CASE)
+        private val IS_FALSE = "0|false|f|no|n|off|".toRegex(RegexOption.IGNORE_CASE)
     }
 }

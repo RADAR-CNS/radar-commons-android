@@ -18,12 +18,10 @@ package org.radarbase.passive.phone
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.SharedPreferences
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Bundle
-import android.os.Process
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
@@ -31,7 +29,7 @@ import org.radarbase.android.source.BaseSourceState
 import org.radarbase.android.source.SourceStatusListener
 import org.radarbase.android.util.BatteryStageReceiver
 import org.radarbase.android.util.ChangeRunner
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.StageLevels
 import org.radarbase.android.util.send
 import org.radarbase.passive.google.places.GooglePlacesManager.Companion.DEVICE_LOCATION_CHANGED
@@ -47,9 +45,12 @@ import java.math.BigDecimal
 import java.util.concurrent.ThreadLocalRandom
 
 class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManager<PhoneLocationService, BaseSourceState>(context), LocationListener {
-    private val locationTopic: DataCache<ObservationKey, PhoneRelativeLocation> = createCache("android_phone_relative_location", PhoneRelativeLocation())
+    private val locationTopic: DataCache<ObservationKey, PhoneRelativeLocation> = createCache(
+        "android_phone_relative_location",
+        PhoneRelativeLocation()
+    )
     private val locationManager = service.getSystemService(Context.LOCATION_SERVICE) as LocationManager?
-    private val handler = SafeHandler.getInstance("PhoneLocation", Process.THREAD_PRIORITY_BACKGROUND)
+    private val locationExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
     private val batteryLevelReceiver = BatteryStageReceiver(context, StageLevels(0.1f, 0.3f), ::onBatteryLevelChanged)
     private var latitudeReference: BigDecimal? = null
     private var longitudeReference: BigDecimal? = null
@@ -62,52 +63,57 @@ class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManage
     @Volatile
     var isAbsoluteLocation: Boolean = false
 
-    private val preferences: SharedPreferences
-        get() = service.getSharedPreferences(PhoneLocationService::class.java.name, Context.MODE_PRIVATE)
-
     init {
         name = service.getString(R.string.phoneLocationServiceDisplayName)
-        preferences.apply {
-            latitudeReference = getString(LATITUDE_REFERENCE, null)
-                    ?.let { BigDecimal(it) }
-
-            longitudeReference = getString(LONGITUDE_REFERENCE, null)
-                    ?.let { BigDecimal(it) }
-
-            if (contains(ALTITUDE_REFERENCE)) {
-                try {
-                    altitudeReference = Double.fromBits(getLong(ALTITUDE_REFERENCE, 0))
-                } catch (ex: ClassCastException) {
-                    // to fix bug where this was stored as String
-                    altitudeReference = getString(ALTITUDE_REFERENCE, "0.0")?.toDouble() ?: 0.0
-                    edit().putLong(ALTITUDE_REFERENCE, altitudeReference.toRawBits()).apply()
-                }
-            } else {
-                altitudeReference = Double.NaN
-            }
-
-            if (contains(REFERENCE_ID)) {
-                referenceId = getInt(REFERENCE_ID, -1)
-            } else {
-                val random = ThreadLocalRandom.current()
-                while (referenceId == 0) {
-                    referenceId = random.nextInt()
-                }
-                edit().putInt(REFERENCE_ID, referenceId).apply()
-            }
-        }
-        isStarted = false
     }
 
     override fun start(acceptableIds: Set<String>) {
         locationManager ?: return
         register()
-        handler.start()
+        locationExecutor.start()
+
+        locationExecutor.execute {
+            service.withMutablePreferences { editor ->
+                latitudeReference = getString(LATITUDE_REFERENCE, null)
+                    ?.let { BigDecimal(it) }
+
+                longitudeReference = getString(LONGITUDE_REFERENCE, null)
+                    ?.let { BigDecimal(it) }
+
+                var editorWasUsed = false
+
+                if (contains(ALTITUDE_REFERENCE)) {
+                    try {
+                        altitudeReference = Double.fromBits(getLong(ALTITUDE_REFERENCE, 0))
+                    } catch (ex: ClassCastException) {
+                        // to fix bug where this was stored as String
+                        altitudeReference = getString(ALTITUDE_REFERENCE, "0.0")?.toDouble() ?: 0.0
+                        editor.putLong(ALTITUDE_REFERENCE, altitudeReference.toRawBits())
+                        editorWasUsed = true
+                    }
+                } else {
+                    altitudeReference = Double.NaN
+                }
+
+                if (contains(REFERENCE_ID)) {
+                    referenceId = getInt(REFERENCE_ID, -1)
+                } else {
+                    val random = ThreadLocalRandom.current()
+                    while (referenceId == 0) {
+                        referenceId = random.nextInt()
+                    }
+                    editor.putInt(REFERENCE_ID, referenceId)
+                    editorWasUsed = true
+                }
+
+                editorWasUsed
+            }
+        }
 
         status = SourceStatusListener.Status.READY
         broadcaster = LocalBroadcastManager.getInstance(service)
 
-        handler.execute {
+        locationExecutor.execute {
             isStarted = true
             batteryLevelReceiver.register()
             status = SourceStatusListener.Status.CONNECTED
@@ -139,7 +145,9 @@ class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManage
                 eventTimestamp, timestamp, reference, provider,
                 latitude.normalize(), longitude.normalize(),
                 altitude?.normalize(), accuracy?.normalize(), speed?.normalize(), bearing?.normalize())
-        send(locationTopic, value)
+        locationExecutor.execute {
+            send(locationTopic, value)
+        }
 
         broadcaster.send(DEVICE_LOCATION_CHANGED)
         logger.info("Location: {} {} {} {} {} {} {} {} {}", provider, eventTimestamp, latitude,
@@ -155,7 +163,7 @@ class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManage
 
     @SuppressLint("MissingPermission")
     fun setLocationUpdateRate(periodGPS: Long, periodNetwork: Long) {
-        handler.executeReentrant {
+        locationExecutor.executeReentrant {
             if (!isStarted || locationManager == null) {
                 return@executeReentrant
             }
@@ -202,9 +210,12 @@ class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManage
             val reference = ThreadLocalRandom.current().nextDouble(-4.0, 4.0) // interval [-4,4)
             latitudeReference = BigDecimal.valueOf(reference)
                     .also {
-                        preferences.edit()
-                                .putString(LATITUDE_REFERENCE, it.toString())
-                                .apply()
+                        locationExecutor.execute {
+                            service.withMutablePreferences { editor ->
+                                editor.putString(LATITUDE_REFERENCE, it.toString())
+                                true
+                            }
+                        }
                     }
         }
 
@@ -221,10 +232,12 @@ class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManage
         val longitude = BigDecimal.valueOf(absoluteLongitude)
         if (longitudeReference == null) {
             longitudeReference = longitude
-
-            preferences.edit()
-                    .putString(LONGITUDE_REFERENCE, longitude.toString())
-                    .apply()
+            locationExecutor.execute {
+                service.withMutablePreferences { editor ->
+                    editor.putString(LONGITUDE_REFERENCE, longitude.toString())
+                    true
+                }
+            }
         }
 
         val relativeLongitude = longitude.subtract(longitudeReference).toDouble()
@@ -250,15 +263,18 @@ class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManage
         if (altitudeReference.isNaN()) {
             altitudeReference = absoluteAltitude
 
-            preferences.edit()
-                    .putLong(ALTITUDE_REFERENCE, absoluteAltitude.toRawBits())
-                    .apply()
+            locationExecutor.execute {
+                service.withMutablePreferences { editor ->
+                    editor.putLong(ALTITUDE_REFERENCE, absoluteAltitude.toRawBits())
+                    true
+                }
+            }
         }
         return (absoluteAltitude - altitudeReference).toFloat()
     }
 
     private fun onBatteryLevelChanged(stage: BatteryStageReceiver.BatteryStage) {
-        handler.executeReentrant {
+        locationExecutor.executeReentrant {
             frequency.applyIfChanged(stage) { resetPollingIntervals() }
         }
     }
@@ -276,7 +292,7 @@ class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManage
 
     override fun onClose() {
         locationManager?.let { manager ->
-            handler.stop {
+            locationExecutor.stop {
                 batteryLevelReceiver.unregister()
                 manager.removeUpdates(this@PhoneLocationManager)
             }
@@ -284,13 +300,13 @@ class PhoneLocationManager(context: PhoneLocationService) : AbstractSourceManage
     }
 
     fun setBatteryLevels(stageLevels: StageLevels) {
-        handler.execute {
+        locationExecutor.execute {
             batteryLevelReceiver.stageLevels = stageLevels
         }
     }
 
     fun setIntervals(value: LocationPollingIntervals) {
-        handler.execute {
+        locationExecutor.execute {
             intervals.applyIfChanged(value) { resetPollingIntervals() }
         }
     }

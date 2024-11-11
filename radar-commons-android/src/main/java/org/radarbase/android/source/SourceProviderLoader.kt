@@ -1,5 +1,7 @@
 package org.radarbase.android.source
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.radarbase.android.RadarConfiguration
 import org.radarbase.android.config.SingleRadarConfiguration
 import org.radarbase.android.util.ChangeApplier
@@ -8,6 +10,7 @@ import java.util.*
 
 class SourceProviderLoader(private var plugins: List<SourceProvider<*>>) {
     private val pluginCache = ChangeApplier<String, List<SourceProvider<*>>>(::loadProvidersFromNames)
+    private val loaderMutex: Mutex = Mutex()
 
     init {
         val pluginNames = plugins.map { it.pluginNames.toHashSet() }
@@ -27,15 +30,19 @@ class SourceProviderLoader(private var plugins: List<SourceProvider<*>>) {
      * [SourceProvider.radarService] on each of the
      * loaded service providers.
      */
-    @Synchronized
-    fun loadProvidersFromNames(config: SingleRadarConfiguration): List<SourceProvider<*>> {
-        val pluginString = listOf(
+    suspend fun loadProvidersFromNames(config: SingleRadarConfiguration): List<SourceProvider<*>> {
+        loaderMutex.withLock {
+            val pluginString = listOf(
                 config.getString(RadarConfiguration.DEVICE_SERVICES_TO_CONNECT, ""),
-                config.getString(RadarConfiguration.PLUGINS, ""))
+                config.getString(RadarConfiguration.PLUGINS, "")
+            )
                 .joinToString(separator = " ")
 
-        return pluginCache.applyIfChanged(pluginString) { providers ->
-            logger.info("Loading plugins {}", providers.map { it.pluginNames.firstOrNull() ?: it })
+            return pluginCache.applyIfChanged(pluginString) { providers ->
+                logger.info(
+                    "Loading plugins {}",
+                    providers.map { it.pluginNames.firstOrNull() ?: it })
+            }
         }
     }
 

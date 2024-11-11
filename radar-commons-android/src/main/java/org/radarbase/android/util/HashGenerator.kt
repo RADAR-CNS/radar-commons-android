@@ -21,7 +21,6 @@ import android.content.Context.MODE_PRIVATE
 import android.os.Build
 import android.security.keystore.KeyProperties.PURPOSE_SIGN
 import android.util.Base64
-import org.radarbase.util.Serialization
 import java.nio.ByteBuffer
 import java.security.InvalidKeyException
 import java.security.Key
@@ -29,7 +28,6 @@ import java.security.NoSuchAlgorithmException
 import java.security.SecureRandom
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
-
 
 /**
  * Hash generator that uses the HmacSHA256 algorithm to hash data. This algorithm ensures that
@@ -42,8 +40,8 @@ import javax.crypto.spec.SecretKeySpec
  * This persists the hash.key property in the given preferences.
  */
 class HashGenerator(
-        context: Context,
-        private val name: String
+    context: Context,
+    private val name: String,
 ) {
     private val sha256: Mac
     private val hashBuffer = ByteArray(4)
@@ -72,7 +70,7 @@ class HashGenerator(
 
     /** Create a unique hash for a given target.  */
     fun createHash(target: Int): ByteArray {
-        Serialization.intToBytes(target, hashBuffer, 0)
+        hashBuffer.put(0, target)
         return sha256.doFinal(hashBuffer)
     }
 
@@ -94,5 +92,13 @@ class HashGenerator(
     companion object {
         private const val HASH_KEY = "hash.key"
         private const val HMAC_SHA256 = "HmacSHA256"
+
+        /** Write an int to given bytes with little-endian encoding, starting from startIndex.  */
+        fun ByteArray.put(startIndex: Int, value: Int) {
+            this[startIndex] = (value shr 24 and 0xFF).toByte()
+            this[startIndex + 1] = (value shr 16 and 0xFF).toByte()
+            this[startIndex + 2] = (value shr 8 and 0xFF).toByte()
+            this[startIndex + 3] = (value and 0xFF).toByte()
+        }
     }
 }

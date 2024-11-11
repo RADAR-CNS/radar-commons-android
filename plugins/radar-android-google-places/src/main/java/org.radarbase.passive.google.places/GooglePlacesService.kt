@@ -18,7 +18,6 @@ package org.radarbase.passive.google.places
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.os.Process
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.google.android.libraries.places.api.Places
 import com.google.android.libraries.places.api.net.PlacesClient
@@ -27,7 +26,7 @@ import org.radarbase.android.source.SourceManager
 import org.radarbase.android.source.SourceService
 import org.radarbase.android.source.SourceStatusListener
 import org.radarbase.android.util.ChangeRunner
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.send
 import org.radarbase.passive.google.places.GooglePlacesManager.Companion.NUMBER_OF_ATTEMPTS_KEY
 import org.slf4j.LoggerFactory
@@ -41,7 +40,7 @@ class GooglePlacesService: SourceService<GooglePlacesState>() {
     val placesClientCreated = AtomicBoolean(false)
     var broadcaster: LocalBroadcastManager? = null
         private set
-    private lateinit var placeHandler: SafeHandler
+    private lateinit var placeHandler: CoroutineTaskExecutor
     var placesClient: PlacesClient? = null
         @Synchronized get() = if (placesClientCreated.get()) field else null
 
@@ -53,7 +52,7 @@ class GooglePlacesService: SourceService<GooglePlacesState>() {
 
     override fun onCreate() {
         super.onCreate()
-        placeHandler = SafeHandler.getInstance("Google-Places-Handler", Process.THREAD_PRIORITY_BACKGROUND).apply {
+        placeHandler = CoroutineTaskExecutor(this::class.simpleName!!).apply {
             start()
         }
         preferences = getSharedPreferences(GooglePlacesService::class.java.name, Context.MODE_PRIVATE)
@@ -95,10 +94,7 @@ class GooglePlacesService: SourceService<GooglePlacesState>() {
                 val currentManager = sourceManager
                 (currentManager as? GooglePlacesManager)?.reScan()
                 if (currentManager == null) {
-                    broadcaster?.send(SOURCE_STATUS_CHANGED) {
-                        putExtra(SOURCE_STATUS_CHANGED, SourceStatusListener.Status.DISCONNECTED.ordinal)
-                        putExtra(SOURCE_SERVICE_CLASS, this@GooglePlacesService.javaClass.name)
-                    }
+                    super.status.value = SourceStatusListener.Status.DISCONNECTED
                 }
                 stopRecording()
             }

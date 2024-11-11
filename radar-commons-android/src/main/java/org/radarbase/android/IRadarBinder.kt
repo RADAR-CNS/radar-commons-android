@@ -17,16 +17,17 @@
 package org.radarbase.android
 
 import android.os.IBinder
+import kotlinx.coroutines.flow.StateFlow
 import org.apache.avro.specific.SpecificRecord
 import org.radarbase.android.data.DataHandler
-import org.radarbase.android.kafka.ServerStatusListener
+import org.radarbase.android.kafka.ServerStatus
 import org.radarbase.android.source.SourceProvider
 import org.radarbase.android.source.SourceServiceConnection
 import org.radarbase.android.util.TimedLong
 import org.radarcns.kafka.ObservationKey
 
 interface IRadarBinder : IBinder {
-    val serverStatus: ServerStatusListener.Status
+    val serverStatus: StateFlow<ServerStatus>
 
     val latestNumberOfRecordsSent: TimedLong
 
@@ -40,4 +41,7 @@ interface IRadarBinder : IBinder {
     fun stopScanning()
 
     fun needsBluetooth(): Boolean
+
+    fun flushCaches(successCallback: () -> Unit, errorCallback: () -> Unit)
+    fun permissionGranted(permissions: Array<String>, grantResults: IntArray)
 }

@@ -21,10 +21,12 @@ import android.location.Location
 import android.location.LocationManager
 import android.location.LocationManager.GPS_PROVIDER
 import android.location.LocationManager.NETWORK_PROVIDER
-import okhttp3.OkHttpClient
+import io.ktor.client.HttpClient
+import kotlinx.coroutines.SupervisorJob
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.BaseSourceState
 import org.radarbase.android.source.SourceStatusListener
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.NetworkConnectedReceiver
 import org.radarbase.android.util.OfflineProcessor
 import org.radarbase.passive.weather.WeatherApiService.Companion.WEATHER_QUERY_INTERVAL_DEFAULT
@@ -34,11 +36,13 @@ import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-class WeatherApiManager(service: WeatherApiService, private val client: OkHttpClient) : AbstractSourceManager<WeatherApiService, BaseSourceState>(service) {
+class WeatherApiManager(service: WeatherApiService, private val client: HttpClient) : AbstractSourceManager<WeatherApiService, BaseSourceState>(service) {
 
     private val processor: OfflineProcessor
     private val weatherTopic = createCache("android_local_weather", LocalWeather())
     private val networkReceiver: NetworkConnectedReceiver
+
+    private val weatherTaskExecutor: CoroutineTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
 
     private val locationManager: LocationManager? = service.getSystemService(Context.LOCATION_SERVICE) as LocationManager?
 
@@ -79,14 +83,16 @@ class WeatherApiManager(service: WeatherApiService, private val client: OkHttpCl
         }
 
         logger.info("Starting WeatherApiManager")
-        networkReceiver.register()
+        weatherTaskExecutor.execute {
+            networkReceiver.monitor()
+        }
         processor.start()
-
+        weatherTaskExecutor.start(SupervisorJob())
         status = SourceStatusListener.Status.CONNECTED
     }
 
-    private fun processWeather() {
-        if (!networkReceiver.state.isConnected) {
+    private suspend fun processWeather() {
+        if (networkReceiver.latestState !is NetworkConnectedReceiver.NetworkState.Connected) {
             logger.warn("No internet connection. Skipping weather query.")
         }
 
@@ -158,8 +164,9 @@ class WeatherApiManager(service: WeatherApiService, private val client: OkHttpCl
     }
 
     override fun onClose() {
-        networkReceiver.unregister()
-        processor.close()
+        weatherTaskExecutor.stop {
+            processor.stop()
+        }
     }
 
     companion object {

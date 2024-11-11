@@ -1,25 +1,31 @@
 package org.radarbase.android.source
 
-import org.radarbase.android.auth.*
+import org.radarbase.android.auth.AppAuthState
+import org.radarbase.android.auth.AuthService
 import org.radarbase.android.auth.AuthService.Companion.RETRY_MAX_DELAY
 import org.radarbase.android.auth.AuthService.Companion.RETRY_MIN_DELAY
+import org.radarbase.android.auth.LoginListener
+import org.radarbase.android.auth.LoginManager
+import org.radarbase.android.auth.SourceMetadata
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.DelayedRetry
-import org.radarbase.android.util.SafeHandler
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 
 class SourceProviderRegistrar(
-        private val authServiceBinder: AuthService.AuthServiceBinder,
-        private val handler: SafeHandler,
-        private val providers: List<SourceProvider<*>>,
-        val onUpdate: (unregisteredProviders: List<SourceProvider<*>>, registeredProviders: List<SourceProvider<*>>) -> Unit
+    private val authServiceBinder: AuthService.AuthServiceBinder,
+    private val executor: CoroutineTaskExecutor,
+    private val providers: List<SourceProvider<*>>,
+    val onUpdate: (unregisteredProviders: List<SourceProvider<*>>, registeredProviders: List<SourceProvider<*>>) -> Unit
 ): LoginListener, Closeable {
-    private val authRegistration: AuthService.LoginListenerRegistration = authServiceBinder.addLoginListener(this)
+    private val authRegistration: AuthService.LoginListenerRegistry = executor.nonSuspendingCompute {
+        authServiceBinder.addLoginListener(this)
+    }
     private var isClosed: Boolean = false
-    private val retry: MutableMap<SourceProvider<*>, Pair<DelayedRetry, SafeHandler.HandlerFuture>> = mutableMapOf()
+    private val retry: MutableMap<SourceProvider<*>, Pair<DelayedRetry, CoroutineTaskExecutor.CoroutineFutureHandle>> = mutableMapOf()
 
     override fun loginSucceeded(manager: LoginManager?, authState: AppAuthState) {
-        handler.execute {
+        executor.execute {
             resetRetry()
 
             val (legalProviders, illegalProviders) = providers.partition { it.canRegisterFor(authState, false) }
@@ -42,7 +48,7 @@ class SourceProviderRegistrar(
         }
     }
 
-    private fun registerProvider(provider: SourceProvider<*>, authState: AppAuthState) {
+    private suspend fun registerProvider(provider: SourceProvider<*>, authState: AppAuthState) {
         if (isClosed) {
             return
         }
@@ -51,10 +57,10 @@ class SourceProviderRegistrar(
             retry -= provider
         }, { ex ->
             logger.error("Failed to register source {}. Trying again", sourceType, ex)
-            handler.executeReentrant {
+            executor.executeReentrant {
                 if (isClosed) { return@executeReentrant }
                 val delay = retry[provider]?.first ?: DelayedRetry(RETRY_MIN_DELAY, RETRY_MAX_DELAY)
-                val future = handler.delay(delay.nextDelay()) { registerProvider(provider, authState) }
+                val future = executor.delay(delay.nextDelay()) { registerProvider(provider, authState) }
                 if (future != null) {
                     retry[provider] = Pair(delay, future)
                 } else {
@@ -67,6 +73,8 @@ class SourceProviderRegistrar(
     override fun loginFailed(manager: LoginManager?, ex: Exception?) {
     }
 
+    override fun logoutSucceeded(manager: LoginManager?, authState: AppAuthState) = Unit
+
     private fun resetRetry() {
         retry.values.forEach { (_, future) ->
             future.cancel()
@@ -75,8 +83,10 @@ class SourceProviderRegistrar(
     }
 
     override fun close() {
-        authServiceBinder.removeLoginListener(authRegistration)
-        handler.executeReentrant {
+        executor.execute {
+            authServiceBinder.removeLoginListener(authRegistration)
+        }
+            executor.executeReentrant {
             resetRetry()
             isClosed = true
         }

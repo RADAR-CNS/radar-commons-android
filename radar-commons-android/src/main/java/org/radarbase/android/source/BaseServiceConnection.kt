@@ -20,17 +20,20 @@ import android.content.ComponentName
 import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.IBinder
-import org.radarbase.android.kafka.ServerStatusListener
+import androidx.lifecycle.LiveData
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import org.radarbase.android.auth.SourceMetadata
+import org.radarbase.android.kafka.ServerStatus
+import org.radarbase.android.kafka.TopicSendResult
+import org.radarbase.android.util.equalTo
 import org.radarbase.data.RecordData
 import org.radarbase.util.Strings
 import org.slf4j.LoggerFactory
 import java.io.IOException
 
-open class BaseServiceConnection<S : BaseSourceState>(private val serviceClassName: String) : ServiceConnection {
-    @get:Synchronized
-    var sourceStatus: SourceStatusListener.Status? = null
-        protected set
-
+open class BaseServiceConnection<S : BaseSourceState>(protected val serviceClassName: String) : ServiceConnection {
     @get:Synchronized
     protected var serviceBinder: SourceBinder<S>? = null
         private set
@@ -39,22 +42,38 @@ open class BaseServiceConnection<S : BaseSourceState>(private val serviceClassNa
         get() = serviceBinder?.sourceName
 
     val isRecording: Boolean
-        get() = sourceStatus !in arrayOf(
-                SourceStatusListener.Status.DISCONNECTED,
-                SourceStatusListener.Status.UNAVAILABLE)
+        get() = sourceStatus?.value !in arrayOf(
+            SourceStatusListener.Status.DISCONNECTED,
+            SourceStatusListener.Status.UNAVAILABLE,
+        )
 
-    val serverStatus: ServerStatusListener.Status?
+    val serverStatus: Flow<ServerStatus>?
         get() = serviceBinder?.serverStatus
 
-    val serverSent: Map<String, Long>?
+    val serverSent: Flow<TopicSendResult>?
         get() = serviceBinder?.serverRecordsSent
 
     val sourceState: S?
         get() = serviceBinder?.sourceState
 
+    var manualAttributes: Map<String, String>?
+        get() = serviceBinder?.manualAttributes
+        set(value) {
+            value ?: return
+            serviceBinder?.manualAttributes = value
+        }
+
+    val sourceStatus: StateFlow<SourceStatusListener.Status>?
+        get() = serviceBinder?.sourceStatus
+
+    val sourceConnectFailed: SharedFlow<SourceService.SourceConnectFailed>?
+        get() = serviceBinder?.sourceConnectFailed
+
+    val registeredSource: SourceMetadata?
+        get() = serviceBinder?.registeredSource
+
     init {
         this.serviceBinder = null
-        this.sourceStatus = SourceStatusListener.Status.UNAVAILABLE
     }
 
     override fun onServiceConnected(className: ComponentName?, service: IBinder?) {
@@ -63,7 +82,6 @@ open class BaseServiceConnection<S : BaseSourceState>(private val serviceClassNa
             try {
                 @Suppress("UNCHECKED_CAST")
                 serviceBinder = service as SourceBinder<S>
-                sourceStatus = sourceState?.status
             } catch (ex: ClassCastException) {
                 logger.error("Cannot process remote source services.", ex)
             }
@@ -73,9 +91,8 @@ open class BaseServiceConnection<S : BaseSourceState>(private val serviceClassNa
     }
 
     @Throws(IOException::class)
-    fun getRecords(topic: String, limit: Int): RecordData<Any, Any>? {
-        return serviceBinder?.getRecords(topic, limit)
-    }
+    suspend fun getRecords(topic: String, limit: Int): RecordData<Any, Any>? =
+        serviceBinder?.getRecords(topic, limit)
 
     /**
      * Start looking for sources to record.
@@ -84,35 +101,28 @@ open class BaseServiceConnection<S : BaseSourceState>(private val serviceClassNa
     fun startRecording(acceptableIds: Set<String>) {
         try {
             serviceBinder?.startRecording(acceptableIds)
-            sourceStatus = serviceBinder?.sourceState?.status
         } catch (ex: IllegalStateException) {
             logger.error("Cannot start service {}: {}", this, ex.message)
         }
     }
 
-    fun restartRecording(acceptableIds: Set<String>) {
-        try {
-            serviceBinder?.restartRecording(acceptableIds)
-            sourceStatus = serviceBinder?.sourceState?.status
-        } catch (ex: IllegalStateException) {
-            logger.error("Cannot restart service {}: {}", this, ex.message)
-        }
+    fun restartRecording(acceptableIds: Set<String>) = try {
+        serviceBinder?.restartRecording(acceptableIds)
+    } catch (ex: IllegalStateException) {
+        logger.error("Cannot restart service {}: {}", this, ex.message)
     }
 
     fun stopRecording() {
         serviceBinder?.stopRecording()
     }
 
-    fun hasService(): Boolean {
-        return serviceBinder != null
-    }
+    fun hasService(): Boolean = serviceBinder != null
 
     override fun onServiceDisconnected(className: ComponentName?) {
         // only do these steps once
         if (hasService()) {
             synchronized(this) {
                 serviceBinder = null
-                sourceStatus = SourceStatusListener.Status.DISCONNECTED
             }
         }
     }
@@ -121,9 +131,7 @@ open class BaseServiceConnection<S : BaseSourceState>(private val serviceClassNa
         serviceBinder?.updateConfiguration(bundle)
     }
 
-    fun numberOfRecords(): Long? {
-        return serviceBinder?.numberOfRecords
-    }
+    fun numberOfRecords(): Flow<Long>? = serviceBinder?.numberOfRecords
 
     /**
      * True if given string is a substring of the source name.
@@ -133,12 +141,13 @@ open class BaseServiceConnection<S : BaseSourceState>(private val serviceClassNa
             return true
         }
         val idOptions = listOfNotNull(
-                serviceBinder?.sourceName,
-                serviceBinder?.sourceState?.id?.getSourceId())
+            serviceBinder?.sourceName,
+            serviceBinder?.sourceState?.id?.sourceId,
+        )
 
-        return !idOptions.isEmpty() && values
-                .map(Strings::containsIgnoreCasePattern)
-                .any { pattern -> idOptions.any { pattern.matcher(it).find() } }
+        return idOptions.isNotEmpty() && values
+            .map(Strings::containsIgnoreCasePattern)
+            .any { pattern -> idOptions.any { pattern.matcher(it).find() } }
     }
 
     fun needsBluetooth(): Boolean {
@@ -149,24 +158,11 @@ open class BaseServiceConnection<S : BaseSourceState>(private val serviceClassNa
         return serviceBinder?.shouldRemainInBackground() == false
     }
 
-    override fun equals(other: Any?): Boolean {
-        if (other === this) {
-            return true
-        }
-        if (other == null || javaClass != other.javaClass) {
-            return false
-        }
-        val otherService = other as BaseServiceConnection<*>
-        return this.serviceClassName == otherService.serviceClassName
-    }
+    override fun equals(other: Any?) = equalTo(other, BaseServiceConnection<*>::serviceClassName)
 
-    override fun hashCode(): Int {
-        return serviceClassName.hashCode()
-    }
+    override fun hashCode(): Int = serviceClassName.hashCode()
 
-    override fun toString(): String {
-        return "ServiceConnection<$serviceClassName>"
-    }
+    override fun toString(): String = "ServiceConnection<$serviceClassName>"
 
     companion object {
         private val logger = LoggerFactory.getLogger(BaseServiceConnection::class.java)

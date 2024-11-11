@@ -16,20 +16,21 @@
 
 package org.radarbase.android.data
 
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.radarbase.topic.AvroTopic
 
-import java.io.Flushable
-
-interface DataCache<K, V> : Flushable, ReadableDataCache {
+interface DataCache<K: Any, V: Any> : ReadableDataCache {
     /** Get the topic the cache stores.  */
     val topic: AvroTopic<K, V>
 
     /** Add a new measurement to the cache.  */
-    fun addMeasurement(key: K, value: V)
+    suspend fun addMeasurement(key: K, value: V)
 
     /** Configuration. */
-    var config: CacheConfiguration
+    val config: MutableStateFlow<CacheConfiguration>
 
     /** Trigger a flush to happen as soon as possible. */
     fun triggerFlush()
+
+    suspend fun flush()
 }

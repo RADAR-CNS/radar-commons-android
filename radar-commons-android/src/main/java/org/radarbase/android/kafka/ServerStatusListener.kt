@@ -16,12 +16,12 @@
 
 package org.radarbase.android.kafka
 
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+
 interface ServerStatusListener {
-    enum class Status {
-        CONNECTING, CONNECTED, DISCONNECTED, UPLOADING, DISABLED, READY, UPLOADING_FAILED, UNAUTHORIZED
-    }
 
-    fun updateServerStatus(status: Status)
+    val serverStatus: StateFlow<ServerStatus>
 
-    fun updateRecordsSent(topicName: String, numberOfRecords: Long)
+    val recordsSent: SharedFlow<TopicSendReceipt>
 }

@@ -31,7 +31,6 @@ import android.media.AudioRecord
 import android.media.AudioRecord.STATE_INITIALIZED
 import android.os.Handler
 import android.os.Looper
-import android.os.Process
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Observer
@@ -39,7 +38,7 @@ import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.SourceStatusListener
 import org.radarbase.android.util.Boast
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.passive.phone.audio.input.PhoneAudioInputService.Companion.LAST_RECORDED_AUDIO_FILE
 import org.radarbase.passive.phone.audio.input.PhoneAudioInputService.Companion.PHONE_AUDIO_INPUT_SHARED_PREFS
 import org.radarbase.passive.phone.audio.input.utils.AudioDeviceUtils
@@ -54,15 +53,16 @@ import java.io.RandomAccessFile
 
 class PhoneAudioInputManager(service: PhoneAudioInputService) : AbstractSourceManager<PhoneAudioInputService,
         PhoneAudioInputState>(service), PhoneAudioInputState.AudioRecordManager, PhoneAudioInputState.AudioRecordingManager {
-    private val audioInputTopic: DataCache<ObservationKey, PhoneAudioInput> = createCache("android_phone_audio_input", PhoneAudioInput())
+    private val audioInputTopic: DataCache<ObservationKey, PhoneAudioInput> = createCache(
+        "android_phone_audio_input",
+        PhoneAudioInput()
+    )
 
     private var audioRecord: AudioRecord? = null
     private var randomAccessWriter: RandomAccessFile? = null
     private var buffer: ByteArray = byteArrayOf()
-    private val audioRecordingHandler = SafeHandler.getInstance(
-        "PHONE-AUDIO-INPUT", Process.THREAD_PRIORITY_BACKGROUND)
-    private val recordProcessingHandler: SafeHandler = SafeHandler.getInstance(
-        "AUDIO-RECORD-PROCESSING", Process.THREAD_PRIORITY_AUDIO)
+    private val audioRecordingHandler = CoroutineTaskExecutor("AudioRecordExecutor")
+    private val recordProcessingHandler: CoroutineTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val preferences: SharedPreferences =
         service.getSharedPreferences(PHONE_AUDIO_INPUT_SHARED_PREFS, Context.MODE_PRIVATE)
@@ -233,21 +233,35 @@ class PhoneAudioInputManager(service: PhoneAudioInputService) : AbstractSourceMa
                 } catch (ex: Exception) {
                     logger.error("Cannot retrieve audio file duration. Discarding sending data")
                 }
-                send(
-                    audioInputTopic, PhoneAudioInput(
-                        currentTime, currentTime, "will be set after s3 functionality is added",
-                        "after data sending to s3 is enabled", mic.productName.toString(), mic.id.toString(),
-                        mic.sampleRates.joinToString(" "),
-                        mic.encodings.joinToString(" ") {
-                            AudioTypeFormatUtil.toLogFriendlyEncoding(it) },
-                        mic.type.toLogFriendlyType(), mic.channelCounts.joinToString(" "), audioDuration, wavFile.length(),
-                        state.isRecordingPlayed, wavFile.extension, sampleRate, AudioTypeFormatUtil.toLogFriendlyEncoding(audioFormat)
+                recordProcessingHandler.execute {
+                    send(
+                        audioInputTopic, PhoneAudioInput(
+                            currentTime,
+                            currentTime,
+                            "will be set after s3 functionality is added",
+                            "after data sending to s3 is enabled",
+                            mic.productName.toString(),
+                            mic.id.toString(),
+                            mic.sampleRates.joinToString(" "),
+                            mic.encodings.joinToString(" ") {
+                                AudioTypeFormatUtil.toLogFriendlyEncoding(it)
+                            },
+                            mic.type.toLogFriendlyType(),
+                            mic.channelCounts.joinToString(" "),
+                            audioDuration,
+                            wavFile.length(),
+                            state.isRecordingPlayed,
+                            wavFile.extension,
+                            sampleRate,
+                            AudioTypeFormatUtil.toLogFriendlyEncoding(audioFormat)
+                        )
                     )
-                )
+                }
                 // Dummy Toast, will be removed after file uploading to s3 will be enabled.
                 Boast.makeText(service, "Sending last recorded audio. Is played? : ${state.isRecordingPlayed}", Toast.LENGTH_LONG).show()
 
             }
+
         }
 
         // After the data is sent:

@@ -24,6 +24,9 @@ import com.google.android.gms.tasks.OnFailureListener
 import com.google.android.gms.tasks.OnSuccessListener
 import com.google.firebase.analytics.FirebaseAnalytics
 import com.google.firebase.remoteconfig.FirebaseRemoteConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.withContext
 import org.radarbase.android.RadarConfiguration
 import org.radarbase.android.RadarConfiguration.Companion.PROJECT_ID_KEY
 import org.radarbase.android.RadarConfiguration.Companion.USER_ID_KEY
@@ -39,82 +42,77 @@ class FirebaseRemoteConfiguration(private val context: Context, inDevelopmentMod
         fetch()
     }
 
-    @Volatile
-    override var status: RadarConfiguration.RemoteConfigStatus = RadarConfiguration.RemoteConfigStatus.INITIAL
-        private set(value) {
-            field = value
-            onStatusUpdateListener(value)
-        }
+    override var status = MutableStateFlow(RadarConfiguration.RemoteConfigStatus.INITIAL)
 
-    private val onFailureListener: OnFailureListener
+    private val onFailureListener: OnFailureListener = OnFailureListener { ex ->
+        logger.info("Failed to fetch Firebase config", ex)
+        status.value = RadarConfiguration.RemoteConfigStatus.ERROR
+    }
     private val hasChange: AtomicBoolean = AtomicBoolean(false)
-    override var onStatusUpdateListener: (RadarConfiguration.RemoteConfigStatus) -> Unit = {}
 
     override var lastFetch: Long = 0L
     override var cache: Map<String, String> = mapOf()
         private set
 
     private val handler: Handler = Handler(Looper.getMainLooper())
-    private val onFetchCompleteHandler: OnSuccessListener<Void>
+    private val onFetchCompleteHandler: OnSuccessListener<Void> = OnSuccessListener {
+        // Once the config is successfully fetched it must be
+        // activated before newly fetched values are returned.
+        firebase.activate()
+                .addOnSuccessListener {
+                    cache = firebase.getKeysByPrefix("")
+                            .mapNotNull { key ->
+                                firebase.getValue(key).asString()
+                                        .takeUnless { it.isEmpty() }
+                                        ?.let { Pair(key, it) }
+                            }
+                            .toMap()
+
+                    status.value = RadarConfiguration.RemoteConfigStatus.FETCHED
+                }
+                .addOnFailureListener(onFailureListener)
+    }
     private var isInDevelopmentMode: Boolean = false
     private var firebaseKeys: Set<String> = HashSet(firebase.getKeysByPrefix(""))
 
     init {
-        this.onFailureListener = OnFailureListener { ex ->
-            logger.info("Failed to fetch Firebase config", ex)
-            status = RadarConfiguration.RemoteConfigStatus.ERROR
-        }
-
-        this.onFetchCompleteHandler = OnSuccessListener {
-            // Once the config is successfully fetched it must be
-            // activated before newly fetched values are returned.
-            firebase.activate()
-                    .addOnSuccessListener {
-                        lastFetch = System.currentTimeMillis()
-                        cache = firebase.getKeysByPrefix("")
-                                .mapNotNull { key ->
-                                    firebase.getValue(key).asString()
-                                            .takeUnless { it.isEmpty() }
-                                            ?.let { Pair(key, it) }
-                                }
-                                .toMap()
-
-                        status = RadarConfiguration.RemoteConfigStatus.FETCHED
-                    }
-                    .addOnFailureListener(onFailureListener)
-        }
-
-        status = RadarConfiguration.RemoteConfigStatus.READY
+        status.value = RadarConfiguration.RemoteConfigStatus.READY
     }
 
     /**
      * Fetch the configuration from the firebase server.
-     * @param maxCacheAge seconds
+     * @param maxCacheAgeMillis seconds
      * @return fetch task or null status is [RadarConfiguration.RemoteConfigStatus.UNAVAILABLE].
      */
-    override fun doFetch(maxCacheAgeMillis: Long) {
-        if (status == RadarConfiguration.RemoteConfigStatus.UNAVAILABLE) {
+    override suspend fun doFetch(maxCacheAgeMillis: Long) {
+        if (status.value == RadarConfiguration.RemoteConfigStatus.UNAVAILABLE) {
             return
         }
         val task = firebase.fetch(maxCacheAgeMillis / 1000L)
         synchronized(this) {
-            status = RadarConfiguration.RemoteConfigStatus.FETCHING
+            status.value = RadarConfiguration.RemoteConfigStatus.FETCHING
             task.addOnSuccessListener(onFetchCompleteHandler)
             task.addOnFailureListener(onFailureListener)
         }
     }
 
-    override fun updateWithAuthState(appAuthState: AppAuthState?) {
+    override suspend fun updateWithAuthState(appAuthState: AppAuthState?) {
         appAuthState ?: return
         val userId = appAuthState.userId ?: return
         val projectId = appAuthState.projectId ?: return
         val baseUrl = appAuthState.baseUrl ?: return
-        FirebaseAnalytics.getInstance(context).apply {
-            setUserId(userId)
-            setUserProperty(USER_ID_KEY, userId.limit(36))
-            setUserProperty(PROJECT_ID_KEY, projectId.limit(36))
-            setUserProperty(RadarConfiguration.BASE_URL_KEY, baseUrl.limit(36))
+        withContext(Dispatchers.IO) {
+            FirebaseAnalytics.getInstance(context).apply {
+                setUserId(userId)
+                setUserProperty(USER_ID_KEY, userId.limit(36))
+                setUserProperty(PROJECT_ID_KEY, projectId.limit(36))
+                setUserProperty(RadarConfiguration.BASE_URL_KEY, baseUrl.limit(36))
+            }
         }
+    }
+
+    override suspend fun stop() {
+        // do nothing
     }
 
     companion object {

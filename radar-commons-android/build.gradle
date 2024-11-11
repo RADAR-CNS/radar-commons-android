@@ -15,6 +15,7 @@
  */
 
 apply from: "$rootDir/gradle/android.gradle"
+apply plugin: 'kotlinx-serialization'
 
 android {
     namespace "org.radarbase.android"
@@ -30,28 +31,42 @@ android {
 description = "Kafka backend for processing device data."
 
 dependencies {
-    api ("org.radarbase:radar-commons:$radar_commons_version") {
-        exclude group: "org.json", module: "json"
-        exclude group: "org.apache.avro", module: "avro"
-    }
-    api ("org.radarbase:radar-schemas-commons:$radar_schemas_commons_version") {
-        exclude group: "org.apache.avro", module: "avro"
-    }
     api(project(":avro-android"))
+    api ("org.radarbase:radar-commons:$radar_commons_version") {
+        exclude group: 'org.json', module: 'json'
+        exclude group: 'org.apache.avro', module: 'avro'
+    }
+    api ("org.radarbase:radar-commons-kotlin:$radar_commons_version")
+    implementation('org.radarbase:radar-app-config-core:0.5.0')
+    api ("org.radarbase:radar-schemas-commons:$radar_schemas_commons_version") {
+        exclude group: 'org.apache.avro', module: 'avro'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-databind'
+    }
     api("org.slf4j:slf4j-api:$slf4j_api_version")
     api("androidx.appcompat:appcompat:$appcompat_version")
 
-    implementation "com.squareup.okhttp3:okhttp:$okhttp_version"
+    implementation("org.radarbase:managementportal-client:2.0.1-SNAPSHOT")
+
+    def lifecycleVersion = "2.6.1"
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:$lifecycleVersion")
+
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:$localbroadcastmanager_version"
     implementation "androidx.legacy:legacy-support-v4:$legacy_support_version"
 
     api "androidx.lifecycle:lifecycle-service:$lifecycle_service_version"
+    implementation "androidx.lifecycle:lifecycle-livedata:2.6.1"
 
     implementation platform("com.google.firebase:firebase-bom:$firebase_bom_version")
     implementation "com.google.firebase:firebase-analytics"
     implementation "com.google.firebase:firebase-config"
     implementation "com.google.firebase:firebase-crashlytics"
     implementation "com.gitlab.mvysny.slf4j:slf4j-handroid:$slf4j_handroid_version"
+
+    implementation("io.ktor:ktor-client-content-negotiation")
+    implementation("io.ktor:ktor-serialization-kotlinx-json")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.6.4")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.6.4")
 }
 
 apply from: "$rootDir/gradle/test.gradle"

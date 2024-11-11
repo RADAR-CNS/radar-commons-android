@@ -23,7 +23,6 @@ import android.media.MediaPlayer
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.Process
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -36,12 +35,12 @@ import androidx.activity.OnBackPressedCallback
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import org.radarbase.android.util.Boast
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.passive.phone.audio.input.PhoneAudioInputState
 import org.radarbase.passive.phone.audio.input.R
+import org.radarbase.passive.phone.audio.input.databinding.FragmentAudioInputPlaybackBinding
 import org.radarbase.passive.phone.audio.input.ui.PhoneAudioInputActivity.Companion.AUDIO_FILE_NAME
 import org.radarbase.passive.phone.audio.input.ui.PhoneAudioInputActivity.Companion.EXTERNAL_DEVICE_NAME
-import org.radarbase.passive.phone.audio.input.databinding.FragmentAudioInputPlaybackBinding
 import org.radarbase.passive.phone.audio.input.utils.AudioDeviceUtils
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -57,7 +56,7 @@ class PhoneAudioInputPlaybackFragment : Fragment() {
     private var mediaPlayer: MediaPlayer? = null
     private val phoneAudioViewModel: PhoneAudioInputViewModel by activityViewModels<PhoneAudioInputViewModel>()
     private var phoneAudioInputState: PhoneAudioInputState? = null
-    private val mediaPlaybackHandler: SafeHandler = SafeHandler.getInstance("PhoneAudioInput", Process.THREAD_PRIORITY_AUDIO)
+    private val mediaPlaybackHandler: CoroutineTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
     private val mainHandler: Handler = Handler(Looper.getMainLooper())
 
     private var audioFilePath: String? = null

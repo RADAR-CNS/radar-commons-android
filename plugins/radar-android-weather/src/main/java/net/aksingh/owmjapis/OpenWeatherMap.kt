@@ -21,9 +21,14 @@
  */
 package net.aksingh.owmjapis
 
-import okhttp3.CacheControl
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import io.ktor.client.HttpClient
+import io.ktor.client.call.body
+import io.ktor.client.request.header
+import io.ktor.client.request.prepareRequest
+import io.ktor.client.request.url
+import io.ktor.http.HttpHeaders
+import io.ktor.http.isSuccess
+import kotlinx.coroutines.runBlocking
 import org.json.JSONException
 import org.json.JSONObject
 import org.slf4j.LoggerFactory
@@ -66,7 +71,7 @@ import java.net.URLEncoder
  * @since 2.5.0.1
  */
 @Suppress("unused")
-class OpenWeatherMap(units: String, lang: String, apiKey: String, client: OkHttpClient) {
+class OpenWeatherMap(units: String, lang: String, apiKey: String, client: HttpClient) {
     private val owmAddressInstance: OWMAddress = OWMAddress(units, lang, apiKey)
     private val owmResponse: OWMResponse = OWMResponse(client, owmAddressInstance)
 
@@ -327,7 +332,7 @@ class OpenWeatherMap(units: String, lang: String, apiKey: String, client: OkHttp
      * @since 2.5.0.3
      */
     private class OWMResponse(
-        private val client: OkHttpClient,
+        private val client: HttpClient,
         private val owmAddress: OWMAddress,
     ) {
         /*
@@ -412,29 +417,31 @@ class OpenWeatherMap(units: String, lang: String, apiKey: String, client: OkHttp
          * @return Response if successful, else `null`
          * @see [HTTP -
         ](http://www.w3.org/Protocols/rfc2616/rfc2616-sec9.html) */
-        private fun httpGet(requestAddress: String): String? {
-            val request: Request = Request.Builder()
-                .get()
-                .url(requestAddress)
-                .cacheControl(CacheControl.FORCE_NETWORK)
-                .header("Accept-Encoding", "gzip, deflate")
-                .build()
-            return try {
-                client.newCall(request).execute().use { response ->
-                    val responseString = response.body?.string()
-                    if (response.isSuccessful && responseString != null) {
+        private fun httpGet(requestAddress: String): String? = runBlocking{
+
+            val request = client.prepareRequest {
+                url(requestAddress)
+                header(HttpHeaders.AcceptEncoding, "gzip, deflate")
+                header(HttpHeaders.CacheControl, "no-cache")
+                header(HttpHeaders.Pragma, "no-cache")
+            }
+
+            try {
+                request.execute { response ->
+                    val responseString = response.body<String>()
+                    if (response.status.isSuccess() && responseString.isNotEmpty()) {
                         responseString
                     } else {
                         logger.error(
                             "Failed to request body (HTTP code {}): {}",
-                            response.code,
+                            response.status.value,
                             responseString,
                         )
                         null
                     }
                 }
-            } catch (e: IOException) {
-                logger.error("Failed to call OpenWeatherMap API", e)
+            } catch (e: Exception) {
+                logger.error("Failed to call API", e)
                 null
             }
         }

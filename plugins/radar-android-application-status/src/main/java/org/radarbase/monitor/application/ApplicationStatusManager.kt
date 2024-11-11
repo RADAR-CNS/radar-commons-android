@@ -21,30 +21,39 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.radarbase.android.data.DataCache
-import org.radarbase.android.kafka.ServerStatusListener
+import org.radarbase.android.data.TableDataHandler
+import org.radarbase.android.kafka.TopicSendReceipt
 import org.radarbase.android.source.AbstractSourceManager
-import org.radarbase.android.source.SourceService.Companion.CACHE_RECORDS_UNSENT_NUMBER
-import org.radarbase.android.source.SourceService.Companion.CACHE_TOPIC
-import org.radarbase.android.source.SourceService.Companion.SERVER_RECORDS_SENT_NUMBER
-import org.radarbase.android.source.SourceService.Companion.SERVER_RECORDS_SENT_TOPIC
-import org.radarbase.android.source.SourceService.Companion.SERVER_STATUS_CHANGED
 import org.radarbase.android.source.SourceStatusListener
-import org.radarbase.android.util.*
+import org.radarbase.android.util.BroadcastRegistration
+import org.radarbase.android.util.ChangeRunner
+import org.radarbase.android.util.CoroutineTaskExecutor
+import org.radarbase.android.util.OfflineProcessor
+import org.radarbase.android.util.takeTrimmedIfNotEmpty
 import org.radarbase.monitor.application.ApplicationStatusService.Companion.UPDATE_RATE_DEFAULT
 import org.radarcns.kafka.ObservationKey
-import org.radarcns.monitor.application.*
+import org.radarcns.monitor.application.ApplicationDeviceInfo
+import org.radarcns.monitor.application.ApplicationExternalTime
+import org.radarcns.monitor.application.ApplicationRecordCounts
+import org.radarcns.monitor.application.ApplicationServerStatus
+import org.radarcns.monitor.application.ApplicationTimeZone
+import org.radarcns.monitor.application.ApplicationUptime
+import org.radarcns.monitor.application.ExternalTimeProtocol
+import org.radarcns.monitor.application.OperatingSystem
+import org.radarcns.monitor.application.ServerStatus
 import org.slf4j.LoggerFactory
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.SocketException
-import java.util.*
+import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeUnit.SECONDS
 
 class ApplicationStatusManager(
-        service: ApplicationStatusService
+    service: ApplicationStatusService
 ) : AbstractSourceManager<ApplicationStatusService, ApplicationState>(service) {
     private val serverTopic: DataCache<ObservationKey, ApplicationServerStatus> = createCache("application_server_status", ApplicationServerStatus())
     private val recordCountsTopic: DataCache<ObservationKey, ApplicationRecordCounts> = createCache("application_record_counts", ApplicationRecordCounts())
@@ -58,6 +67,9 @@ class ApplicationStatusManager(
     private val sntpClient: SntpClient = SntpClient()
     private val prefs: SharedPreferences = service.getSharedPreferences(ApplicationStatusManager::class.java.name, Context.MODE_PRIVATE)
     private var tzProcessor: OfflineProcessor? = null
+
+    private val applicationStatusExecutor: CoroutineTaskExecutor =
+        CoroutineTaskExecutor(this::class.simpleName!!)
 
     @get:Synchronized
     @set:Synchronized
@@ -98,6 +110,7 @@ class ApplicationStatusManager(
     override fun start(acceptableIds: Set<String>) {
         status = SourceStatusListener.Status.READY
 
+        applicationStatusExecutor.start()
         processor.start {
             val osVersionCode: Int = this.prefs.getInt("operatingSystemVersionCode", -1)
             val appVersionCode: Int = this.prefs.getInt("appVersionCode", -1)
@@ -133,20 +146,33 @@ class ApplicationStatusManager(
         tzProcessor?.start()
 
         logger.info("Starting ApplicationStatusManager")
-        LocalBroadcastManager.getInstance(service).apply {
-            serverStatusReceiver = register(SERVER_STATUS_CHANGED) { _, intent ->
-                state.serverStatus = ServerStatusListener.Status.values()[intent.getIntExtra(SERVER_STATUS_CHANGED, 0)]
+            with(applicationStatusExecutor) {
+                service.dataHandler?.let { handler ->
+                    execute {
+                        handler.numberOfRecords
+                            .collect { records: TableDataHandler.CacheSize ->
+                                val topic = records.topicName
+                                val noOfRecords = records.numberOfRecords
+                                logger.trace("Topic {} has {} records in cache", topic, noOfRecords)
+                                state.cachedRecords[topic] = noOfRecords.coerceAtLeast(0)
+                            }
+                        }
+
+                    execute {
+                        handler.recordsSent.collect { sent: TopicSendReceipt ->
+                            logger.trace("Topic {} sent {} records", sent.topic, sent.numberOfRecords)
+                            state.addRecordsSent(sent.numberOfRecords)
+                        }
+                    }
+
+                    execute {
+                        handler.serverStatus.collect {
+                            state.serverStatus = it
+                            logger.trace("Updated Server Status to {}", it)
+                        }
+                    }
+                }
             }
-            serverRecordsReceiver = register(SERVER_RECORDS_SENT_TOPIC) { _, intent ->
-                val numberOfRecordsSent = intent.getLongExtra(SERVER_RECORDS_SENT_NUMBER, 0)
-                state.addRecordsSent(numberOfRecordsSent.coerceAtLeast(0))
-            }
-            cacheReceiver = register(CACHE_TOPIC) { _, intent ->
-                val topic = intent.getStringExtra(CACHE_TOPIC) ?: return@register
-                val records = intent.getLongExtra(CACHE_RECORDS_UNSENT_NUMBER, 0)
-                state.cachedRecords[topic] = records.coerceAtLeast(0)
-            }
-        }
 
         status = SourceStatusListener.Status.CONNECTED
     }
@@ -172,34 +198,37 @@ class ApplicationStatusManager(
         }
 
     // using versionCode
-    private fun processDeviceInfo() {
+    private suspend fun processDeviceInfo() {
         deviceInfoCache.applyIfChanged(currentApplicationInfo) { deviceInfo ->
-            send(
-                deviceInfoTopic,
-                ApplicationDeviceInfo(
-                    currentTime,
-                    deviceInfo.manufacturer,
-                    deviceInfo.model,
-                    OperatingSystem.ANDROID,
-                    deviceInfo.osVersion,
-                    deviceInfo.osVersionCode,
-                    deviceInfo.appVersion,
-                    deviceInfo.appVersionCode,
-                ),
-            )
-
-            prefs.edit().apply {
-                putString("manufacturer", deviceInfo.manufacturer)
-                putString("model", deviceInfo.model)
-                putString("operatingSystemVersion", deviceInfo.osVersion)
-                putInt("operatingSystemVersionCode", deviceInfo.osVersionCode ?: -1)
-                putString("appVersion", deviceInfo.appVersion)
-                putInt("appVersionCode", deviceInfo.appVersionCode ?: -1)
-            }.apply()
+            applicationStatusExecutor.execute {
+                send(
+                    deviceInfoTopic,
+                    ApplicationDeviceInfo(
+                        currentTime,
+                        deviceInfo.manufacturer,
+                        deviceInfo.model,
+                        OperatingSystem.ANDROID,
+                        deviceInfo.osVersion,
+                        deviceInfo.osVersionCode,
+                        deviceInfo.appVersion,
+                        deviceInfo.appVersionCode,
+                    ),
+                )
+                withContext(Dispatchers.IO) {
+                    prefs.edit().apply {
+                        putString("manufacturer", deviceInfo.manufacturer)
+                        putString("model", deviceInfo.model)
+                        putString("operatingSystemVersion", deviceInfo.osVersion)
+                        putInt("operatingSystemVersionCode", deviceInfo.osVersionCode ?: -1)
+                        putString("appVersion", deviceInfo.appVersion)
+                        putInt("appVersionCode", deviceInfo.appVersionCode ?: -1)
+                    }.apply()
+                }
+            }
         }
     }
 
-    private fun processReferenceTime() {
+    private suspend fun processReferenceTime() {
         val ntpServer = ntpServer ?: return
         if (sntpClient.requestTime(ntpServer, 5000)) {
             val delay = sntpClient.roundTripTime / 1000.0
@@ -219,7 +248,7 @@ class ApplicationStatusManager(
         }
     }
 
-    private fun processServerStatus() {
+    private suspend fun processServerStatus() {
         val time = currentTime
 
         val status: ServerStatus = state.serverStatus.toServerStatus()
@@ -245,12 +274,12 @@ class ApplicationStatusManager(
         return previousInetAddress?.hostAddress
     }
 
-    private fun processUptime() {
+    private suspend fun processUptime() {
         val uptime = (SystemClock.elapsedRealtime() - creationTimeStamp) / 1000.0
         send(uptimeTopic, ApplicationUptime(currentTime, uptime))
     }
 
-    private fun processRecordsSent() {
+    private suspend fun processRecordsSent() {
         val time = currentTime
 
         val recordsCached = state.cachedRecords.values
@@ -265,26 +294,32 @@ class ApplicationStatusManager(
     }
 
     override fun onClose() {
-        this.processor.close()
+        applicationStatusExecutor.stop {
+            this.processor.stop()
+        }
         cacheReceiver?.unregister()
         serverRecordsReceiver?.unregister()
         serverStatusReceiver?.unregister()
     }
 
-    private fun processTimeZone() {
+    private suspend fun processTimeZone() {
         val now = System.currentTimeMillis()
         val tzOffset = TimeZone.getDefault().getOffset(now)
         tzOffsetCache.applyIfChanged(tzOffset / 1000) { offset ->
-            send(
-                timeZoneTopic,
-                ApplicationTimeZone(
-                    now / 1000.0,
-                    offset,
-                ),
-            )
-            prefs.edit()
-                .putInt("timeZoneOffset", offset)
-                .apply()
+            applicationStatusExecutor.execute {
+                send(
+                    timeZoneTopic,
+                    ApplicationTimeZone(
+                        now / 1000.0,
+                        offset,
+                    ),
+                )
+                withContext(Dispatchers.IO) {
+                    prefs.edit()
+                        .putInt("timeZoneOffset", offset)
+                        .apply()
+                }
+            }
         }
     }
 
@@ -294,7 +329,7 @@ class ApplicationStatusManager(
             var processor = this.tzProcessor
             if (processor == null) {
                 processor = OfflineProcessor(service) {
-                    process = listOf(this@ApplicationStatusManager::processTimeZone)
+                    process = listOf { this@ApplicationStatusManager.processTimeZone() }
                     requestCode = APPLICATION_TZ_PROCESSOR_REQUEST_CODE
                     requestName = APPLICATION_TZ_PROCESSOR_REQUEST_NAME
                     interval(tzUpdateRate, unit)
@@ -310,7 +345,9 @@ class ApplicationStatusManager(
             }
         } else { // disable timezone processor
             this.tzProcessor?.let {
-                it.close()
+                applicationStatusExecutor.execute {
+                    it.stop()
+                }
                 this.tzProcessor = null
             }
         }
@@ -339,13 +376,13 @@ class ApplicationStatusManager(
 
         private fun Long.toIntCapped(): Int = if (this <= Int.MAX_VALUE) toInt() else Int.MAX_VALUE
 
-        private fun ServerStatusListener.Status?.toServerStatus(): ServerStatus = when (this) {
-            ServerStatusListener.Status.CONNECTED,
-            ServerStatusListener.Status.READY,
-            ServerStatusListener.Status.UPLOADING -> ServerStatus.CONNECTED
-            ServerStatusListener.Status.DISCONNECTED,
-            ServerStatusListener.Status.DISABLED,
-            ServerStatusListener.Status.UPLOADING_FAILED -> ServerStatus.DISCONNECTED
+        private fun org.radarbase.android.kafka.ServerStatus?.toServerStatus(): ServerStatus = when (this) {
+            org.radarbase.android.kafka.ServerStatus.CONNECTED,
+            org.radarbase.android.kafka.ServerStatus.READY,
+            org.radarbase.android.kafka.ServerStatus.UPLOADING -> ServerStatus.CONNECTED
+            org.radarbase.android.kafka.ServerStatus.DISCONNECTED,
+            org.radarbase.android.kafka.ServerStatus.DISABLED,
+            org.radarbase.android.kafka.ServerStatus.UPLOADING_FAILED -> ServerStatus.DISCONNECTED
             else -> ServerStatus.UNKNOWN
         }
     }

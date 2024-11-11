@@ -12,10 +12,14 @@ import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.os.Build
 import androidx.annotation.RequiresApi
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import androidx.appcompat.content.res.AppCompatResources.getDrawable
 import androidx.core.graphics.drawable.toBitmap
 import org.radarbase.android.R
 import org.slf4j.LoggerFactory
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Handle notifications and notification channels.
@@ -23,41 +27,61 @@ import org.slf4j.LoggerFactory
 class NotificationHandler(
     private val context: Context
 ) {
+    private val isCreated = AtomicBoolean(false)
+
     val manager : NotificationManager?
         get() = context.getSystemService(NOTIFICATION_SERVICE) as NotificationManager?
 
-    init {
+    suspend fun onCreate() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            createNotificationChannels()
+            manager?.createNotificationChannels()
         }
     }
 
     @RequiresApi(api = Build.VERSION_CODES.O)
-    private fun createNotificationChannels() {
-        manager?.run {
-            if (!shouldCreate()) return
-            logger.debug("Creating notification channels")
-            createNotificationChannel(NOTIFICATION_CHANNEL_INFO,
+    private suspend fun NotificationManager.createNotificationChannels() {
+        if (!isCreated.compareAndSet(false, true)) return
+        logger.debug("Creating notification channels")
+        coroutineScope {
+            launch(Dispatchers.IO) {
+                createNotificationChannel(
+                    NOTIFICATION_CHANNEL_INFO,
                     NotificationManager.IMPORTANCE_LOW,
-                    R.string.channel_info_name, R.string.channel_info_description)
+                    R.string.channel_info_name, R.string.channel_info_description
+                )
+            }
 
-            createNotificationChannel(NOTIFICATION_CHANNEL_NOTIFY,
+            launch(Dispatchers.IO) {
+                createNotificationChannel(
+                    NOTIFICATION_CHANNEL_NOTIFY,
                     NotificationManager.IMPORTANCE_DEFAULT,
-                    R.string.channel_notify_name, R.string.channel_notify_description)
+                    R.string.channel_notify_name, R.string.channel_notify_description
+                )
+            }
 
-            createNotificationChannel(NOTIFICATION_CHANNEL_ALERT,
+            launch(Dispatchers.IO) {
+                createNotificationChannel(
+                    NOTIFICATION_CHANNEL_ALERT,
                     NotificationManager.IMPORTANCE_HIGH,
-                    R.string.channel_alert_name, R.string.channel_alert_description)
+                    R.string.channel_alert_name, R.string.channel_alert_description
+                )
+            }
 
-            createNotificationChannel(NOTIFICATION_CHANNEL_FINAL_ALERT,
+            launch(Dispatchers.IO) {
+                createNotificationChannel(
+                    NOTIFICATION_CHANNEL_FINAL_ALERT,
                     NotificationManager.IMPORTANCE_HIGH,
                     R.string.channel_final_alert_name,
-                    R.string.channel_final_alert_description) {
-                setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM),
+                    R.string.channel_final_alert_description
+                ) {
+                    setSound(
+                        RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM),
                         AudioAttributes.Builder().apply {
                             setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                             setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
-                        }.build())
+                        }.build()
+                    )
+                }
             }
         }
     }

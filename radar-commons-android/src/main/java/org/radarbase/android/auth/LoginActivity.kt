@@ -21,12 +21,22 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.annotation.Keep
 import androidx.appcompat.app.AppCompatActivity
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.radarbase.android.R
 import org.radarbase.android.RadarApplication.Companion.radarApp
+import org.radarbase.android.util.BindState
 import org.radarbase.android.util.Boast
-import org.radarbase.android.util.send
+import org.radarbase.android.util.ManagedServiceConnection
+import org.radarbase.android.util.ManagedServiceConnection.Companion.serviceConnection
 import org.slf4j.LoggerFactory
+
+typealias AuthServiceStateReactor = suspend (AuthService.AuthServiceBinder) -> Unit
 
 /** Activity to log in using a variety of login managers.  */
 @Keep
@@ -34,7 +44,33 @@ abstract class LoginActivity : AppCompatActivity(), LoginListener {
     private var startedFromActivity: Boolean = false
     private var refreshOnly: Boolean = false
 
-    protected lateinit var authConnection: AuthServiceConnection
+    protected lateinit var authServiceConnection: ManagedServiceConnection<AuthService.AuthServiceBinder>
+    private var authServiceActionBinder: AuthService.AuthServiceBinder? = null
+
+    private var listenerRegistry: AuthService.LoginListenerRegistry? = null
+
+    private val serviceBoundActions: MutableList<AuthServiceStateReactor> = mutableListOf(
+        { it.isInLoginActivity = true },
+        { binder ->
+            binder.managers
+                .find { it.onActivityCreate(this@LoginActivity) }
+                ?.let { binder.update(it) }
+        },
+        {binder: AuthService.AuthServiceBinder ->
+            logger.debug("Bound AuthService to ${this::class.simpleName!!}")
+            listenerRegistry = binder.addLoginListener(this)
+            binder.refreshIfOnline()
+        }
+    )
+
+    private val serviceUnboundActions: MutableList<AuthServiceStateReactor> = mutableListOf(
+        {it.isInLoginActivity = false},
+        {binder: AuthService.AuthServiceBinder -> listenerRegistry?.let {
+            logger.debug("Unbound AuthService from ${this::class.simpleName!!}")
+            binder.removeLoginListener(it)
+            listenerRegistry = null
+        }}
+    )
 
     override fun onCreate(savedInstanceBundle: Bundle?) {
         super.onCreate(savedInstanceBundle)
@@ -53,25 +89,40 @@ abstract class LoginActivity : AppCompatActivity(), LoginListener {
             Boast.makeText(this, R.string.login_failed, Toast.LENGTH_LONG).show()
         }
 
-        authConnection = AuthServiceConnection(this, this)
-        authConnection.onBoundListeners.add(0) { binder ->
-            binder.isInLoginActivity = true
+        authServiceConnection = serviceConnection(radarApp.authService)
+
+        lifecycleScope.launch {
+            authServiceConnection.state
+                .onEach { bindState: BindState<AuthService.AuthServiceBinder> ->
+                    when (bindState) {
+                        is ManagedServiceConnection.BoundService -> {
+                            authServiceActionBinder = bindState.binder
+                            authServiceActionBinder?.also { binder ->
+                                serviceBoundActions.forEach { action ->
+                                    action(binder)
+                                }
+                            }
+                        }
+
+                        is ManagedServiceConnection.Unbound -> {
+                            authServiceActionBinder = authServiceActionBinder?.let { binder ->
+                                serviceUnboundActions.forEach { action ->
+                                    action(binder)
+                                }
+                                null
+                            }
+                        }
+                    }
+                }.launchIn(this)
         }
-        authConnection.onBoundListeners.add { binder ->
-            binder.refresh()
-            binder.managers
-                    .find { it.onActivityCreate(this@LoginActivity)}
-                    ?.let { binder.update(it) }
+        lifecycleScope.launch {
+            authServiceConnection.bind()
         }
-        authConnection.onUnboundListeners.add { binder ->
-            binder.isInLoginActivity = false
-        }
-        authConnection.bind()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        authConnection.unbind()
+        authServiceConnection.unbind()
     }
 
     public override fun onSaveInstanceState(outState: Bundle) {
@@ -94,8 +145,6 @@ abstract class LoginActivity : AppCompatActivity(), LoginListener {
     override fun loginSucceeded(manager: LoginManager?, authState: AppAuthState) {
         logger.info("Login succeeded")
 
-        LocalBroadcastManager.getInstance(this).send(ACTION_LOGIN_SUCCESS)
-
         if (startedFromActivity) {
             logger.debug("Start next activity with result")
             setResult(RESULT_OK, intent)
@@ -113,6 +162,5 @@ abstract class LoginActivity : AppCompatActivity(), LoginListener {
         private val logger = LoggerFactory.getLogger(LoginActivity::class.java)
         const val ACTION_LOGIN = "org.radarcns.auth.LoginActivity.login"
         const val ACTION_REFRESH = "org.radarcns.auth.LoginActivity.refresh"
-        const val ACTION_LOGIN_SUCCESS = "org.radarcns.auth.LoginActivity.success"
     }
 }

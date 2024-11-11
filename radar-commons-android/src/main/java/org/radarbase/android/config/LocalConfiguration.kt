@@ -3,6 +3,8 @@ package org.radarbase.android.config
 import android.content.Context
 import android.content.Context.MODE_PRIVATE
 import android.content.SharedPreferences
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -21,12 +23,13 @@ class LocalConfiguration(context: Context) : LocalConfig {
             .toMap(ConcurrentHashMap())
 
     override fun put(key: String, value: Any): String? {
-        require((value is String
-                || value is Long
-                || value is Int
-                || value is Float
-                || value is Boolean)) { ("Cannot put value of type " + value.javaClass
-                + " into RadarConfiguration") }
+        require(
+            value is String ||
+                    value is Long ||
+                    value is Int ||
+                    value is Float ||
+                    value is Boolean
+        ) { "Cannot put value of type ${value.javaClass} into RadarConfiguration" }
         val stringValue = value as? String ?: value.toString()
         val oldValue = config[key]
         if (stringValue.isNotEmpty()) {
@@ -38,16 +41,18 @@ class LocalConfiguration(context: Context) : LocalConfig {
         return oldValue
     }
 
-    override fun persistChanges(): Boolean {
-        if (hasChange.compareAndSet(true, false)) {
-            val editor = preferences.edit()
-            config.forEach { (key, value) ->
-                editor.putString(key, value)
+    override suspend fun persistChanges(): Boolean {
+        return if (hasChange.compareAndSet(true, false)) {
+            withContext(Dispatchers.IO) {
+                val editor = preferences.edit()
+                config.forEach { (key, value) ->
+                    editor.putString(key, value)
+                }
+                editor.commit()
             }
-            editor.apply()
-            return true
+            true
         } else {
-            return false
+            false
         }
     }
 
@@ -57,7 +62,7 @@ class LocalConfiguration(context: Context) : LocalConfig {
                 config.clear()
                 hasChange.set(true)
             }
-        } else if (config.keys.removeAll(keys)) {
+        } else if (config.keys.removeAll(keys.toHashSet())) {
             hasChange.set(true)
         }
     }

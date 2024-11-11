@@ -21,11 +21,21 @@ import android.content.Context
 import android.content.Intent
 import com.google.android.gms.location.SleepClassifyEvent
 import com.google.android.gms.location.SleepSegmentEvent
+import org.radarbase.android.util.CoroutineTaskExecutor
 
-class SleepReceiver(private val googleSleepManager: GoogleSleepManager) : BroadcastReceiver() {
+class SleepReceiver(
+    private val googleSleepManager: GoogleSleepManager,
+    private val sleepTaskExecutor: CoroutineTaskExecutor
+) : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             intent ?: return
-            if (SleepSegmentEvent.hasEvents(intent)) googleSleepManager.sendSleepSegmentData(intent)
-            if (SleepClassifyEvent.hasEvents(intent)) googleSleepManager.sendSleepClassifyData(intent)
+            sleepTaskExecutor.execute {
+                if (SleepSegmentEvent.hasEvents(intent)) googleSleepManager.sendSleepSegmentData(
+                    intent
+                )
+                if (SleepClassifyEvent.hasEvents(intent)) googleSleepManager.sendSleepClassifyData(
+                    intent
+                )
+            }
         }
 }

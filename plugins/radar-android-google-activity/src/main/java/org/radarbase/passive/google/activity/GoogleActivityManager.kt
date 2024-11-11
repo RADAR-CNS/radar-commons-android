@@ -21,7 +21,6 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.os.Process
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.ActivityRecognition
@@ -32,7 +31,7 @@ import org.radarbase.android.data.DataCache
 import org.radarbase.android.source.AbstractSourceManager
 import org.radarbase.android.source.BaseSourceState
 import org.radarbase.android.source.SourceStatusListener
-import org.radarbase.android.util.SafeHandler
+import org.radarbase.android.util.CoroutineTaskExecutor
 import org.radarbase.android.util.toPendingIntentFlag
 import org.radarbase.passive.google.activity.GoogleActivityProvider.Companion.ACTIVITY_RECOGNITION_COMPAT
 import org.radarcns.kafka.ObservationKey
@@ -42,9 +41,12 @@ import org.radarcns.passive.google.TransitionType
 import org.slf4j.LoggerFactory
 
 class GoogleActivityManager(context: GoogleActivityService) : AbstractSourceManager<GoogleActivityService, BaseSourceState>(context) {
-    private val activityTransitionEventTopic: DataCache<ObservationKey, GoogleActivityTransitionEvent> = createCache("android_google_activity_transition_event", GoogleActivityTransitionEvent())
+    private val activityTransitionEventTopic: DataCache<ObservationKey, GoogleActivityTransitionEvent> = createCache(
+        "android_google_activity_transition_event",
+        GoogleActivityTransitionEvent()
+    )
 
-    private val activityHandler = SafeHandler.getInstance("Google Activity", Process.THREAD_PRIORITY_BACKGROUND)
+    private val activityTaskExecutor = CoroutineTaskExecutor(this::class.simpleName!!)
     private val activityPendingIntent: PendingIntent
     private val activityTransitionReceiver: ActivityTransitionReceiver
 
@@ -53,15 +55,15 @@ class GoogleActivityManager(context: GoogleActivityService) : AbstractSourceMana
 
     init {
         name = service.getString(R.string.google_activity_display_name)
-        activityTransitionReceiver = ActivityTransitionReceiver(this)
+        activityTransitionReceiver = ActivityTransitionReceiver(this, activityTaskExecutor)
         activityPendingIntent = createActivityPendingIntent()
     }
 
     override fun start(acceptableIds: Set<String>) {
         register()
-        activityHandler.start()
+        activityTaskExecutor.start()
         status = SourceStatusListener.Status.READY
-        activityHandler.execute {
+        activityTaskExecutor.execute {
             registerActivityTransitionReceiver()
             registerForActivityUpdates()
         }
@@ -97,7 +99,7 @@ class GoogleActivityManager(context: GoogleActivityService) : AbstractSourceMana
         }
     }
 
-    fun sendActivityTransitionUpdates(activityIntent: Intent) {
+    suspend fun sendActivityTransitionUpdates(activityIntent: Intent) {
         logger.info("Activity transition event data received")
         val activityTransitionResult: ActivityTransitionResult = ActivityTransitionResult.extractResult(activityIntent) ?: return
 
@@ -148,7 +150,7 @@ class GoogleActivityManager(context: GoogleActivityService) : AbstractSourceMana
     }
 
     override fun onClose() {
-        activityHandler.stop {
+        activityTaskExecutor.stop {
             unRegisterFromActivityUpdates()
             unRegisterFromActivityReceiver()
         }
