@@ -174,6 +174,10 @@ class PhoneUsageManager(context: PhoneUsageService) : AbstractSourceManager<Phon
             CONFIGURATION_CHANGE -> UsageEventType.CONFIG
             SHORTCUT_INVOCATION_COMPAT -> UsageEventType.SHORTCUT
             USER_INTERACTION -> UsageEventType.INTERACTION
+            FOREGROUND_SERVICE_START -> UsageEventType.FOREGROUND_SERVICE_START
+            FOREGROUND_SERVICE_STOP -> UsageEventType.FOREGROUND_SERVICE_STOP
+            STANDBY_BUCKET_CHANGED -> UsageEventType.STANDBY_BUCKET_CHANGED
+            ACTIVITY_STOPPED -> UsageEventType.STOPPED
             else -> UsageEventType.OTHER
         }
 
