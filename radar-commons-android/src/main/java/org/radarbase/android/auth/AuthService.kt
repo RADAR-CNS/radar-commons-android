@@ -110,6 +110,15 @@ abstract class AuthService : Service(), LoginListener {
     }
 
     /**
+     * Update the current authentication state. This method should only be called if there is a
+     * necessity to update the authentication state while processing authentication requests.
+     * Otherwise, it is preferable to call [AuthService.loginSucceeded] to update the authentication state.
+     */
+    fun updateState(newState: AppAuthState) {
+        appAuth = newState
+    }
+
+    /**
      * Refresh the access token. If the existing token is still valid, do not refresh.
      * The request gets handled in a separate thread and returns a result via loginSucceeded. If
      * there is no network connectivity, just check if the authentication could be refreshed if the

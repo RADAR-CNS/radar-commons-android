@@ -5,6 +5,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import org.radarbase.android.auth.AppAuthState
 import org.radarbase.android.auth.AuthStringParser
+import org.radarbase.android.auth.AuthenticationSource
 import org.radarbase.android.auth.SourceMetadata
 import org.radarbase.android.auth.SourceMetadata.Companion.optNonEmptyString
 import org.radarbase.android.auth.SourceType
@@ -14,7 +15,7 @@ import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.util.*
 
-class GetSubjectParser(private val state: AppAuthState) : AuthStringParser {
+class GetSubjectParser(private val state: AppAuthState, private val initiatedBy: AuthenticationSource) : AuthStringParser {
 
     @Throws(IOException::class)
     override fun parse(value: String): AppAuthState {
@@ -33,7 +34,10 @@ class GetSubjectParser(private val state: AppAuthState) : AuthStringParser {
                 userId = parseUserId(jsonObject)
                 projectId = parseProjectId(project)
                 needsRegisteredSources = true
-                authenticationSource = SOURCE_TYPE
+                authenticationSource = when (initiatedBy) {
+                    AuthenticationSource.MANAGEMENT_PORTAL -> SOURCE_TYPE
+                    AuthenticationSource.SELF_ENROLMENT_PORTAL -> "org.radarcns.android.auth.oauth2.OAuth2LoginManager"
+                }
 
                 jsonObject.opt("attributes")?.let { attrObjects ->
                     if (attrObjects is JSONArray) {

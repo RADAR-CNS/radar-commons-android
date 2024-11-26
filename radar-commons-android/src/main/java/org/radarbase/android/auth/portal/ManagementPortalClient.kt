@@ -181,7 +181,7 @@ class ManagementPortalClient constructor(
         private val illegalSourceCharacters = "[^_'.@A-Za-z0-9- ]+".toRegex()
 
         @Throws(JSONException::class)
-        internal fun sourceRegistrationBody(source: SourceMetadata): JSONObject {
+        fun sourceRegistrationBody(source: SourceMetadata): JSONObject {
             val requestBody = JSONObject()
 
             val typeId = requireNotNull(source.type?.id) { "Cannot register source without a type" }
@@ -204,7 +204,7 @@ class ManagementPortalClient constructor(
         }
 
         @Throws(JSONException::class)
-        internal fun sourceUpdateBody(source: SourceMetadata): JSONObject {
+        fun sourceUpdateBody(source: SourceMetadata): JSONObject {
             return JSONObject().apply {
                 for ((key, value) in source.attributes) {
                     put(key, value)
@@ -219,7 +219,7 @@ class ManagementPortalClient constructor(
          * @throws JSONException if the provided body is not valid JSON with the correct properties
          */
         @Throws(JSONException::class)
-        internal fun parseSourceRegistration(body: String, source: SourceMetadata) {
+        fun parseSourceRegistration(body: String, source: SourceMetadata) {
             logger.debug("Parsing source from {}", body)
             val responseObject = JSONObject(body)
             source.sourceId = responseObject.getString("sourceId")

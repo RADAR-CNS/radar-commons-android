@@ -10,6 +10,7 @@ import org.radarbase.android.RadarConfiguration.Companion.OAUTH2_CLIENT_SECRET
 import org.radarbase.android.RadarConfiguration.Companion.UNSAFE_KAFKA_CONNECTION
 import org.radarbase.android.auth.AppAuthState
 import org.radarbase.android.auth.AuthService
+import org.radarbase.android.auth.AuthenticationSource
 import org.radarbase.android.auth.LoginManager
 import org.radarbase.android.auth.SourceMetadata
 import org.radarbase.android.auth.portal.ManagementPortalClient.Companion.MP_REFRESH_TOKEN_PROPERTY
@@ -209,7 +210,7 @@ class ManagementPortalLoginManager(private val listener: AuthService, state: App
                 failure(ex)
             } catch (ex: ConflictException) {
                 try {
-                    client.getSubject(authState, GetSubjectParser(authState)).let { authState ->
+                    client.getSubject(authState, GetSubjectParser(authState, AuthenticationSource.MANAGEMENT_PORTAL)).let { authState ->
                         updateSources(authState)
                         sources[source.sourceId]?.let { source ->
                             success(authState, source)

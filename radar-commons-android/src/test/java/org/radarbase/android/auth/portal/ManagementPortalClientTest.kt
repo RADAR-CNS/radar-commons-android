@@ -8,6 +8,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.radarbase.android.auth.AppAuthState
+import org.radarbase.android.auth.AuthenticationSource
 import org.radarbase.android.auth.SourceMetadata
 import org.radarbase.android.auth.SourceType
 import org.radarbase.config.ServerConfig
@@ -97,7 +98,7 @@ class ManagementPortalClientTest {
             val authState = AppAuthState {
                 userId = "sub-1"
             }
-            val retAuthState = client.getSubject(authState, GetSubjectParser(authState))
+            val retAuthState = client.getSubject(authState, GetSubjectParser(authState, AuthenticationSource.MANAGEMENT_PORTAL))
 
             val expected = SourceMetadata().apply {
                 type = SourceType(0, "p", "m", "v", true)
